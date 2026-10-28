@@ -127,10 +127,10 @@ Perforce records a resolve accepted with markers as resolved, which is why shelv
 
 ## Install
 
-From GitHub (the repo is private, so this uses your SSH key; `github:joaofbmaia/omp-p4` works too once git can authenticate over HTTPS):
+From GitHub:
 
 ```sh
-omp plugin install git@github.com:joaofbmaia/omp-p4.git
+omp plugin install github:joaofbmaia/omp-p4
 omp plugin upgrade omp-p4   # later, to pull the latest commit
 ```
 
