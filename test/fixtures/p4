@@ -1,0 +1,8 @@
+#!/bin/bash
+# Fake p4 for tests: `p4 -ztag -Mj info` reports a client rooted at $FAKE_P4_ROOT.
+if [ "$*" = "-ztag -Mj info" ]; then
+  echo "{\"clientName\":\"${FAKE_P4_CLIENT:-test_ws}\",\"clientRoot\":\"$FAKE_P4_ROOT\",\"userName\":\"tester\",\"serverAddress\":\"perforce:1666\"}"
+  exit 0
+fi
+echo '{"data":"fake p4: unsupported","severity":3}'
+exit 1

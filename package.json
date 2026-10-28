@@ -1,0 +1,13 @@
+{
+	"name": "omp-p4",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Perforce support for oh-my-pi: check-out on write, p4 tools, AI-described changelists",
+	"type": "module",
+	"omp": {
+		"extensions": ["./index.ts"]
+	},
+	"scripts": {
+		"test": "bun test"
+	}
+}
