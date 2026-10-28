@@ -130,7 +130,7 @@ Perforce records a resolve accepted with markers as resolved, which is why shelv
 From GitHub:
 
 ```sh
-omp plugin install github:joaofbmaia/omp-p4
+omp plugin install "github:joaofbmaia/omp-p4#main"
 omp plugin upgrade omp-p4   # later, to pull the latest commit
 ```
 
