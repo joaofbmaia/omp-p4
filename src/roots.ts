@@ -102,10 +102,10 @@ export async function workspaceForPath(ctx: ExtensionContext | undefined, file: 
 	const abs = canonical(path.resolve(ctx?.cwd ?? process.cwd(), file));
 	// Prefer the session root containing the file: one `p4 info` per root, not per directory.
 	const roots = ctx ? await sessionRoots(ctx) : [];
-	const root = roots
-		.filter(r => r.kind === "p4" && r.ws && isUnder(abs, r.dir))
-		.sort((a, b) => b.dir.length - a.dir.length)[0];
-	const ws = root?.ws ?? (await findWorkspace(fs.existsSync(abs) && fs.statSync(abs).isDirectory() ? abs : path.dirname(abs)));
+	const root = roots.filter(r => isUnder(abs, r.dir)).sort((a, b) => b.dir.length - a.dir.length)[0];
+	// Inside a git root (and that repo, not a client nested in it, owns the file): no need to ask p4.
+	if (root?.kind === "git" && root.gitRoot && gitRootOf(path.dirname(abs)) === root.gitRoot) return null;
+	const ws = (root?.kind === "p4" ? root.ws : undefined) ?? (await findWorkspace(fs.existsSync(abs) && fs.statSync(abs).isDirectory() ? abs : path.dirname(abs)));
 	return ws && p4OwnsPath(ws, abs) ? ws : null;
 }
 

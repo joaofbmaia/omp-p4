@@ -11,7 +11,7 @@ import * as fsSync from "node:fs";
 import { constants as fsConstants } from "node:fs";
 import * as path from "node:path";
 import { hasGitMarkers, hasP4Markers, p4MarkersToGit } from "./markers";
-import { P4Error, p4, p4Strict } from "./p4";
+import { isLoginError, isTrustError, P4Error, p4, p4Strict } from "./p4";
 
 export const WORK_TAG = "[omp-work]";
 const WORK_DESCRIPTION = `${WORK_TAG} Files opened by the omp agent. Split with /p4-change before submitting.`;
@@ -39,8 +39,17 @@ export interface OpenedFile {
 	unresolved?: boolean;
 }
 
-const workspaceCache = new Map<string, Promise<Workspace | null>>();
+/**
+ * `p4 info` answers per directory. Hits are kept; "not a Perforce client" is kept
+ * for a few minutes (a git repo is asked once, not on every tool call), and a
+ * failure (server slow or down, ticket expired) is retried after a short pause.
+ */
+const workspaceCache = new Map<string, { pending: Promise<Workspace | null>; expires: number }>();
+const NOT_A_CLIENT_TTL_MS = 5 * 60_000;
+const RETRY_AFTER_MS = 30_000;
 const workChangeCache = new Map<string, Promise<string>>();
+/** Clients known to have no work changelist yet, until when (a session in git files must not ask every prompt). */
+const noWorkChangeUntil = new Map<string, number>();
 
 /** Workspaces detected so far, to answer subdirectories without another `p4 info`. */
 const knownWorkspaces: Workspace[] = [];
@@ -72,31 +81,35 @@ function knownWorkspaceFor(dir: string): Workspace | undefined {
 export function findWorkspace(dir: string): Promise<Workspace | null> {
 	const known = knownWorkspaceFor(fsRealpath(dir));
 	if (known) return Promise.resolve(known);
-	let pending = workspaceCache.get(dir);
-	if (!pending) {
-		pending = detect(dir);
-		workspaceCache.set(dir, pending);
-		// Do not pin a transient failure (server down, ticket expired) for the whole process.
-		pending.then(ws => ws ?? workspaceCache.delete(dir)).catch(() => workspaceCache.delete(dir));
-	}
-	return pending;
+	const cached = workspaceCache.get(dir);
+	if (cached && Date.now() < cached.expires) return cached.pending;
+	const entry = { pending: detect(dir).then(({ ws, failed }) => {
+		entry.expires = ws ? Infinity : failed === undefined ? 0 : Date.now() + (failed ? RETRY_AFTER_MS : NOT_A_CLIENT_TTL_MS);
+		return ws;
+	}), expires: Infinity };
+	workspaceCache.set(dir, entry);
+	return entry.pending;
 }
 
-async function detect(dir: string): Promise<Workspace | null> {
+/** `failed`: true for no answer from the server, undefined for an answer to retry at once (login, trust). */
+async function detect(dir: string): Promise<{ ws: Workspace | null; failed?: boolean }> {
 	let result;
 	try {
 		result = await p4(["info"], { cwd: dir, timeoutMs: 10_000 });
 	} catch {
-		return null; // p4 binary not installed
+		return { ws: null, failed: false }; // p4 binary not installed
 	}
 	const info = result.records[0];
-	if (!info?.clientName || info.clientName === "*unknown*" || !info.clientRoot) return null;
+	// No answer. Login and trust errors come back at once and are fixed in a terminal, so ask
+	// again next time; a slow or unreachable server is given a pause before the next try.
+	if (!info) return { ws: null, failed: isLoginError(result) || isTrustError(result) ? undefined : true };
+	if (!info.clientName || info.clientName === "*unknown*" || !info.clientRoot) return { ws: null, failed: false };
 	const root = await fs.realpath(info.clientRoot).catch(() => null);
 	const realDir = await fs.realpath(dir).catch(() => dir);
-	if (!root || !isUnder(realDir, root)) return null;
+	if (!root || !isUnder(realDir, root)) return { ws: null, failed: false };
 	const ws = { client: info.clientName, user: info.userName, server: info.serverAddress, root, cwd: realDir };
 	knownWorkspaces.push(ws);
-	return ws;
+	return { ws, failed: false };
 }
 
 function fsRealpath(dir: string): string {
@@ -127,8 +140,10 @@ export function workChange(ws: Workspace): Promise<string> {
 export async function existingWorkChange(ws: Workspace): Promise<string | undefined> {
 	const cached = workChangeCache.get(ws.client);
 	if (cached) return cached;
+	if (Date.now() < (noWorkChangeUntil.get(ws.client) ?? 0)) return undefined;
 	const found = await findWorkChange(ws);
 	if (found) workChangeCache.set(ws.client, Promise.resolve(found));
+	else noWorkChangeUntil.set(ws.client, Date.now() + NOT_A_CLIENT_TTL_MS);
 	return found;
 }
 
@@ -142,6 +157,7 @@ async function findWorkChange(ws: Workspace): Promise<string | undefined> {
 /** Forget the cached work changelist (after `/p4-change` deletes it). */
 export function forgetWorkChange(ws: Workspace): void {
 	workChangeCache.delete(ws.client);
+	noWorkChangeUntil.delete(ws.client);
 }
 
 async function findOrCreateWorkChange(ws: Workspace): Promise<string> {

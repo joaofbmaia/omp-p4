@@ -95,3 +95,43 @@ describe("symlinked paths", () => {
 		expect(canonical(path.join(link, "rtl/not/yet/there.sv"))).toBe(dir("client/rtl/not/yet/there.sv"));
 	});
 });
+
+describe("p4 round trips for git roots", () => {
+	test("a git root is asked once, not on every tool call", async () => {
+		const trace = dir("trace.log");
+		process.env.OMP_P4_TRACE = trace;
+		try {
+			fs.mkdirSync(dir("outside2/.git"), { recursive: true });
+			const ctx = { cwd: dir("outside2"), sessionManager: { getHeader: () => ({ additionalDirectories: [] }) } } as unknown as ExtensionContext;
+			for (let i = 0; i < 3; i++) {
+				const groups = await groupByWorkspace(ctx, [dir("outside2/src/a.ts"), dir("outside2/README.md")]);
+				expect(groups.size).toBe(0);
+			}
+			expect(fs.readFileSync(trace, "utf8").trim().split("\n").length).toBe(1);
+		} finally {
+			delete process.env.OMP_P4_TRACE;
+		}
+	});
+});
+
+describe("multi-root sessions", () => {
+	test("a Perforce root plus a git root: each asked once, ownership per root", async () => {
+		const trace = dir("trace-multi.log");
+		fs.mkdirSync(dir("repo/.git"), { recursive: true });
+		const ctx = {
+			cwd: dir("client"),
+			sessionManager: { getHeader: () => ({ additionalDirectories: [dir("repo")] }) },
+		} as unknown as ExtensionContext;
+		process.env.OMP_P4_TRACE = trace;
+		try {
+			for (let i = 0; i < 3; i++) {
+				const groups = await groupByWorkspace(ctx, [dir("repo/src/a.py"), dir("repo/deep/b.py"), dir("client/rtl/fifo.sv"), dir("client/tools/gen/src/x.py")]);
+				expect([...groups.values()].flatMap(g => g.files)).toEqual([dir("client/rtl/fifo.sv")]);
+			}
+			const calls = fs.existsSync(trace) ? fs.readFileSync(trace, "utf8").trim().split("\n").length : 0;
+			expect(calls).toBeLessThanOrEqual(2);
+		} finally {
+			delete process.env.OMP_P4_TRACE;
+		}
+	});
+});
