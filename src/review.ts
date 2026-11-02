@@ -1,12 +1,12 @@
 /**
  * `/p4-review`: run omp's code-review pipeline, or its annotation overlay, on
- * a Perforce diff — the agent's work changelist, a shelf or a submitted change.
+ * a Perforce diff — the changelists worked in this session, a shelf or a submitted change.
  */
 import type { ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { changeFiles, diffChangeFile, diffOpenedFile, filePriority } from "./diff";
 import { p4 } from "./p4";
 import { findReviewForChange, formatComments, getComments } from "./review-server";
-import { existingWorkChange, openedFiles, type Workspace } from "./workspace";
+import { openedFiles, type Workspace } from "./workspace";
 
 /** omp rejects LLM review requests above these. */
 const MAX_REVIEW_CHARS = 50_000;
@@ -17,7 +17,8 @@ export interface Piece {
 	diff: string;
 }
 
-export async function runReviewCommand(ws: Workspace, args: string, ctx: ExtensionCommandContext): Promise<void> {
+/** `session`: the changelists worked in this session (the default scope). */
+export async function runReviewCommand(ws: Workspace, args: string, ctx: ExtensionCommandContext, session: string[] = []): Promise<void> {
 	const tokens = args.trim().split(/\s+/).filter(Boolean);
 	const annotate = tokens.includes("--annotate");
 	const all = tokens.includes("--all");
@@ -34,11 +35,12 @@ export async function runReviewCommand(ws: Workspace, args: string, ctx: Extensi
 			if (pieces.length === 0) return ctx.ui.notify(`${label}: no files to review.`, "warning");
 			reviewerContext = await existingReviewComments(ws, Number(change));
 		} else {
-			const work = all ? undefined : await existingWorkChange(ws);
-			const opened = all || work ? await openedFiles(ws, work) : [];
-			if (opened.length === 0) return ctx.ui.notify("Nothing opened to review.", "info");
+			const opened = (await openedFiles(ws)).filter(f => all || session.includes(f.change));
+			if (opened.length === 0) {
+				return ctx.ui.notify(all ? "Nothing opened to review." : "Nothing changed in this session yet; /p4-review --all reviews everything open.", "info");
+			}
 			pieces = await Promise.all(opened.map(async f => ({ name: f.depotFile, diff: await diffOpenedFile(ws, f) })));
-			label = all ? `All opened files on ${ws.client}` : "Agent work changelist";
+			label = all ? `All opened files on ${ws.client}` : `This session's changelists (${[...new Set(opened.map(f => f.change))].join(", ")})`;
 		}
 	} finally {
 		ctx.ui.setWorkingMessage();

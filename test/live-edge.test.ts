@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { p4, p4Strict } from "../src/p4";
 import { changeDiff } from "../src/review";
-import { takeSnapshot } from "../src/snapshots";
+import { captureOpened, takeSnapshot } from "../src/snapshots";
 import {
 	findWorkspace,
 	openedFiles,
@@ -19,7 +19,6 @@ import {
 	shelve,
 	unshelve,
 	type Workspace,
-	workChange,
 	createChange,
 	reopen,
 } from "../src/workspace";
@@ -70,7 +69,7 @@ describe.skipIf(!LIVE)("exclusive-lock files (+l)", () => {
 		const file = path.join(a, "lib/cells.lib");
 		let message = "";
 		try {
-			await openForEdit(wsA, file);
+			await openForEdit(wsA, file, await createChange(wsA, "lock test"));
 		} catch (err) {
 			message = (err as Error).message;
 		}
@@ -100,10 +99,11 @@ describe.skipIf(!LIVE)("stream depots", () => {
 	test("check-out, reconcile, shelve, unshelve and diffs work in a stream client", async () => {
 		expect(ws.client).toBe("stream_ws");
 		const file = path.join(dir, "rtl/fifo.sv");
-		await openForEdit(ws, file);
+		const work = await createChange(ws, "Stream work");
+		await openForEdit(ws, file, work);
 		write(file, "module fifo;\n  // edited\nendmodule\n");
 		write(path.join(dir, "rtl/new.sv"), "module n;\nendmodule\n");
-		const { entries } = await reconcile(ws, [path.join(dir, "rtl/new.sv")]);
+		const { entries } = await reconcile(ws, [path.join(dir, "rtl/new.sv")], { change: work });
 		expect(entries.map(e => [e.action, e.depotFile])).toEqual([["add", "//streams/main/rtl/new.sv"]]);
 		const change = await createChange(ws, "Stream change");
 		await reopen(ws, change, ["//streams/main/rtl/fifo.sv", "//streams/main/rtl/new.sv"]);
@@ -111,7 +111,7 @@ describe.skipIf(!LIVE)("stream depots", () => {
 		const { pieces } = await changeDiff(ws, change);
 		expect(pieces.map(p => p.name).sort()).toEqual(["//streams/main/rtl/fifo.sv", "//streams/main/rtl/new.sv"]);
 		await p4Strict(["revert", "-w", "//streams/main/rtl/..."], { cwd: dir });
-		const { opened } = await unshelve(ws, change);
+		const { opened } = await unshelve(ws, change, change);
 		expect(opened.length).toBe(2);
 	});
 });
@@ -129,8 +129,9 @@ describe.skipIf(!LIVE)("Unicode-mode server", () => {
 		fs.writeFileSync(path.join(dir, ".p4config"), `P4PORT=${server.port}\nP4USER=${server.user}\nP4CLIENT=uni_ws\n`);
 		const ws = await findWorkspace(dir);
 		expect(ws?.client).toBe("uni_ws");
-		await openForEdit(ws!, path.join(dir, "rtl/ünïcode.sv"));
-		expect((await openedFiles(ws!, await workChange(ws!))).map(f => f.depotFile)).toEqual(["//depot/rtl/ünïcode.sv"]);
+		const work = await createChange(ws!, "Unicode work");
+		await openForEdit(ws!, path.join(dir, "rtl/ünïcode.sv"), work);
+		expect((await openedFiles(ws!, work)).map(f => f.depotFile)).toEqual(["//depot/rtl/ünïcode.sv"]);
 	});
 });
 
@@ -169,7 +170,7 @@ describe.skipIf(!LIVE)("ticket expiring mid-session", () => {
 		await Bun.sleep(2_500);
 		let message = "";
 		try {
-			await workChange(ws);
+			await createChange(ws, "after expiry");
 		} catch (err) {
 			message = (err as Error).message;
 		}
@@ -196,13 +197,19 @@ describe.skipIf(!LIVE)("large changelists", () => {
 			timings[label] = Math.round(performance.now() - t);
 			return out;
 		};
-		const { entries } = await time("reconcile (explicit paths)", () => reconcile(ws, files));
+		const work = await createChange(ws, "Big change");
+		const { entries } = await time("reconcile (explicit paths)", () => reconcile(ws, files, { change: work }));
 		expect(entries.length).toBe(COUNT);
-		const opened = await time("opened files", async () => openedFiles(ws, await workChange(ws)));
+		const opened = await time("opened files", async () => openedFiles(ws, work));
 		expect(opened.length).toBe(COUNT);
 		expect(await time("readiness check", () => readinessProblems(ws, opened))).toEqual([]);
-		const snapshot = await time("snapshot", () => takeSnapshot(ws));
-		expect(snapshot?.files.size).toBe(COUNT);
+		const snapshot = await time("snapshot (open files + their contents)", async () => {
+			const s = await takeSnapshot(ws);
+			await captureOpened(s);
+			return s;
+		});
+		expect(snapshot.opened.size).toBe(COUNT);
+		expect(snapshot.contents.size).toBe(COUNT);
 		console.log("large changelist timings (ms):", timings);
 		for (const ms of Object.values(timings)) expect(ms).toBeLessThan(30_000);
 	}, 180_000);

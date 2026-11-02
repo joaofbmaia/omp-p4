@@ -1,111 +1,160 @@
 /**
  * Code snapshots for `/branch` rewinds.
  *
- * Before each prompt, the content of every file open in the work changelist is
- * copied into memory. A file that was not open then is, by construction, still
- * at its have-revision, so restoring it means `p4 revert`. Rewinding to that
- * prompt can therefore put the work changelist back exactly as it was, without
- * shelving anything to the server.
+ * At the first change of each prompt, the extension records which files are open
+ * on the client and in which changelist (one fstat). Then, just before the agent
+ * changes a file, its content is copied into memory (edit/write name their files;
+ * before bash, every open file is copied). Rewinding to that prompt therefore puts
+ * back contents, adds, deletes and changelist membership, across every changelist,
+ * without shelving anything to the server. A file that was not open at the time
+ * is, by construction, at its have-revision, so restoring it means `p4 revert`.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { p4Strict } from "./p4";
-import { existingWorkChange, type OpenedFile, openedFiles, openForDelete, type Workspace, workChange } from "./workspace";
+import { createChange, isStaleChangeError, type OpenedFile, openedFiles, openForDelete, reopen, type Workspace } from "./workspace";
 
 const MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
 
-interface SnapshotFile {
+interface OpenedAt {
 	action: string;
-	/** Content at snapshot time; undefined for deletes and unreadable or binary files. */
-	content?: Buffer;
+	change: string;
+	depotFile: string;
 }
 
 export interface Snapshot {
 	takenAt: number;
-	files: Map<string, SnapshotFile>;
+	/** Files open on the client when the prompt first changed something, by local path. */
+	opened: Map<string, OpenedAt>;
+	/** Content just before the agent first changed each file; null when the file did not exist. */
+	contents: Map<string, Buffer | null>;
+	bytes: number;
+	/** False once the size cap stopped contents being kept; rewind then skips content it lacks. */
+	complete: boolean;
 }
 
-/** Capture the work changelist, or `undefined` when it is too large to hold in memory. */
-export async function takeSnapshot(ws: Workspace): Promise<Snapshot | undefined> {
-	const files = new Map<string, SnapshotFile>();
-	let total = 0;
-	const work = await existingWorkChange(ws);
-	for (const file of work ? await openedFiles(ws, work) : []) {
-		if (file.action.endsWith("delete")) {
-			files.set(file.localPath, { action: file.action });
+/** Record what is open on the client; contents are captured later, file by file. */
+export async function takeSnapshot(ws: Workspace): Promise<Snapshot> {
+	const opened = new Map<string, OpenedAt>();
+	for (const f of await openedFiles(ws)) opened.set(f.localPath, { action: f.action, change: f.change, depotFile: f.depotFile });
+	return { takenAt: Date.now(), opened, contents: new Map(), bytes: 0, complete: true };
+}
+
+/** Copy the current content of `files` (first time each is seen this prompt). */
+export async function captureFiles(snapshot: Snapshot, files: string[]): Promise<void> {
+	for (const file of files) {
+		if (snapshot.contents.has(file)) continue;
+		const content = await fs.readFile(file).catch(() => null);
+		if (content && snapshot.bytes + content.length > MAX_SNAPSHOT_BYTES) {
+			snapshot.complete = false;
 			continue;
 		}
-		const content = await fs.readFile(file.localPath).catch(() => undefined);
-		total += content?.length ?? 0;
-		if (total > MAX_SNAPSHOT_BYTES) return undefined;
-		files.set(file.localPath, { action: file.action, content });
+		snapshot.bytes += content?.length ?? 0;
+		snapshot.contents.set(file, content);
 	}
-	return { takenAt: Date.now(), files };
+}
+
+/** Before bash: copy every file that was open (bash may change any of them). */
+export async function captureOpened(snapshot: Snapshot): Promise<void> {
+	await captureFiles(
+		snapshot,
+		[...snapshot.opened].filter(([, f]) => !f.action.endsWith("delete")).map(([p]) => p),
+	);
 }
 
 export interface RestorePlan {
+	/** Opened after the snapshot: back to the have-revision (added files are removed). */
 	revert: OpenedFile[];
-	rewrite: { path: string; snapshot: SnapshotFile; current?: OpenedFile }[];
+	/** Same action, different changelist now: move back. */
+	move: { file: OpenedFile; to: string }[];
+	/** Content, action or open state differs: put back as it was. */
+	rewrite: { path: string; was: OpenedAt; content?: Buffer | null; current?: OpenedFile }[];
 }
 
-/** What restoring `snapshot` would change; empty when the work changelist already matches. */
+/** What restoring `snapshot` would change; empty when the client already matches. */
 export async function planRestore(ws: Workspace, snapshot: Snapshot): Promise<RestorePlan> {
-	const work = await existingWorkChange(ws);
-	const current = work ? await openedFiles(ws, work) : [];
-	const plan: RestorePlan = { revert: [], rewrite: [] };
+	const current = await openedFiles(ws);
+	const plan: RestorePlan = { revert: [], move: [], rewrite: [] };
 	const seen = new Set<string>();
 	for (const file of current) {
 		seen.add(file.localPath);
-		const snap = snapshot.files.get(file.localPath);
-		if (!snap) {
+		const was = snapshot.opened.get(file.localPath);
+		if (!was) {
 			plan.revert.push(file);
 			continue;
 		}
-		if (snap.action !== file.action) {
-			plan.rewrite.push({ path: file.localPath, snapshot: snap, current: file });
+		const content = snapshot.contents.get(file.localPath);
+		if (was.action !== file.action) {
+			plan.rewrite.push({ path: file.localPath, was, content, current: file });
 			continue;
 		}
-		if (snap.content) {
+		if (content) {
 			const now = await fs.readFile(file.localPath).catch(() => undefined);
-			if (!now || !now.equals(snap.content)) plan.rewrite.push({ path: file.localPath, snapshot: snap, current: file });
+			if (!now || !now.equals(content)) {
+				plan.rewrite.push({ path: file.localPath, was, content, current: file });
+				continue;
+			}
 		}
+		if (was.change !== file.change) plan.move.push({ file, to: was.change });
 	}
-	for (const [p, snap] of snapshot.files) if (!seen.has(p)) plan.rewrite.push({ path: p, snapshot: snap });
+	for (const [p, was] of snapshot.opened) {
+		if (!seen.has(p)) plan.rewrite.push({ path: p, was, content: snapshot.contents.get(p) });
+	}
 	return plan;
 }
 
+export function planIsEmpty(plan: RestorePlan): boolean {
+	return plan.revert.length + plan.move.length + plan.rewrite.length === 0;
+}
+
 export async function applyRestore(ws: Workspace, plan: RestorePlan): Promise<void> {
-	const work = await workChange(ws);
+	// A changelist that was deleted since (it emptied out) gets a stand-in.
+	const replaced = new Map<string, string>();
+	const into = async <T>(change: string, open: (change: string) => Promise<T>): Promise<T> => {
+		const target = replaced.get(change) ?? change;
+		try {
+			return await open(target);
+		} catch (err) {
+			if (!isStaleChangeError(err)) throw err;
+			const fresh = await createChange(ws, `Restored by rewind (was changelist ${change})`);
+			replaced.set(change, fresh);
+			return open(fresh);
+		}
+	};
+
 	// Files opened after the snapshot go back to their have-revision; -w also removes added files.
 	if (plan.revert.length > 0) {
 		await p4Strict(["revert", "-w", ...plan.revert.map(f => f.localPath)], { cwd: ws.cwd });
 	}
+	for (const { file, to } of plan.move) await into(to, change => reopen(ws, change, [file.depotFile]));
 	for (const item of plan.rewrite) {
-		const { snapshot: snap, current } = item;
-		if (current && current.action !== snap.action) {
+		const { was, current } = item;
+		if (current && current.action !== was.action) {
 			await p4Strict(["revert", "-w", item.path], { cwd: ws.cwd });
 		}
-		if (snap.action.endsWith("delete")) {
-			if (current?.action !== snap.action) await openForDelete(ws, item.path);
+		const stillOpen = current && current.action === was.action;
+		if (was.action.endsWith("delete")) {
+			if (!stillOpen) await into(was.change, change => openForDelete(ws, item.path, change));
+			else if (current.change !== was.change) await into(was.change, change => reopen(ws, change, [current.depotFile]));
 			continue;
 		}
-		if (snap.content === undefined) continue;
-		const isAdd = snap.action.endsWith("add") || snap.action === "branch";
-		if (!isAdd && current?.action !== snap.action) {
-			await p4Strict(["edit", "-c", work, item.path], { cwd: ws.cwd });
+		const isAdd = was.action.endsWith("add") || was.action === "branch";
+		if (!isAdd && !stillOpen) await into(was.change, change => p4Strict(["edit", "-c", change, item.path], { cwd: ws.cwd }));
+		if (item.content) {
+			await fs.mkdir(path.dirname(item.path), { recursive: true });
+			await Bun.write(item.path, item.content);
 		}
-		await fs.mkdir(path.dirname(item.path), { recursive: true });
-		await Bun.write(item.path, snap.content);
-		if (isAdd && current?.action !== snap.action) {
-			await p4Strict(["add", "-c", work, item.path], { cwd: ws.cwd });
-		}
+		if (isAdd && !stillOpen) await into(was.change, change => p4Strict(["add", "-c", change, item.path], { cwd: ws.cwd }));
+		if (stillOpen && current.change !== was.change) await into(was.change, change => reopen(ws, change, [current.depotFile]));
 	}
 }
 
 export function describePlan(ws: Workspace, plan: RestorePlan): string {
 	const rel = (p: string) => path.relative(ws.cwd, p) || p;
+	const cl = (c: string) => (c === "default" ? "the default changelist" : `CL ${c}`);
 	return [
 		...plan.revert.map(f => `revert   ${rel(f.localPath)} (${f.action})`),
-		...plan.rewrite.map(r => `restore  ${rel(r.path)}${r.snapshot.action !== r.current?.action ? ` (${r.snapshot.action})` : ""}`),
+		...plan.move.map(m => `move     ${rel(m.file.localPath)} back to ${cl(m.to)}`),
+		...plan.rewrite.map(r => `restore  ${rel(r.path)}${r.was.action !== r.current?.action ? ` (${r.was.action})` : ""}`),
 	].join("\n");
 }

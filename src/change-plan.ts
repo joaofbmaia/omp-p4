@@ -1,25 +1,27 @@
 /**
- * `/p4-change`: turn the agent's work changelist into described, reviewable
- * pending changelists. Splits are per file, since Perforce cannot put hunks of
- * one file into different changelists. Never submits.
+ * `/p4-change`: split a changelist by topic. Each part gets a description, or
+ * joins one of your existing pending changelists when it belongs there; the
+ * first new part keeps the original changelist number (and any review on it).
+ * Splits are per file, since Perforce cannot put hunks of one file into
+ * different changelists. Never submits.
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent";
 import { renderDiffs } from "./diff";
+import type { ChangeRouter } from "./changes";
 import { p4 } from "./p4";
 import { waitForReview } from "./review-server";
 import { p4OwnsPath } from "./roots";
 import {
-	createChange,
-	deleteChange,
-	existingWorkChange,
-	forgetWorkChange,
 	type OpenedFile,
 	openedFiles,
+	type PendingChange,
+	pendingChanges,
 	readinessProblems,
 	reconcile,
 	reopen,
+	setDescription,
 	shelve,
 	withReviewKeyword,
 	type Workspace,
@@ -28,28 +30,37 @@ import {
 export interface PlannedChange {
 	description: string;
 	files: string[];
+	/** Join this existing pending changelist instead of making a new one. */
+	change?: string;
 }
 
 const DIFF_BUDGET_CHARS = 80_000;
 const TEMPLATE_PATHS = [".omp/p4-description.md", ".p4-description.md"];
 
-export async function runChangeCommand(ws: Workspace, args: string, ctx: ExtensionCommandContext): Promise<void> {
+export async function runChangeCommand(ws: Workspace, args: string, ctx: ExtensionCommandContext, router: ChangeRouter): Promise<void> {
 	const flag = (name: string) => new RegExp(`(^|\\s)--${name}(?=\\s|$)`).test(args);
 	const single = flag("single");
 	// --review is the team flow: #review in each description, then shelve.
 	const startReviews = flag("review");
 	const shelveAfter = startReviews || flag("shelve");
-	const hint = args.replace(/(^|\s)--(single|shelve|review)(?=\s|$)/g, " ").trim();
-	await offerReconcile(ws, ctx);
-	const work = await existingWorkChange(ws);
-	if (!work) {
-		ctx.ui.notify("The agent has not opened any files yet.", "info");
+	const number = /(?:^|\s)(\d+)(?=\s|$)/.exec(args)?.[1];
+	const hint = args.replace(/(^|\s)--(single|shelve|review)(?=\s|$)/g, " ").replace(/(?:^|\s)\d+(?=\s|$)/, " ").trim();
+
+	const pending = await pendingChanges(ws);
+	const source = number ?? router.current(ws) ?? router.touched(ws).find(c => router.isCreated(ws, c));
+	const sourceInfo = pending.find(c => c.change === source);
+	if (!source || !sourceInfo) {
+		ctx.ui.notify(
+			source ? `Changelist ${source} is not a pending changelist on ${ws.client}.` : "Nothing changed in this session yet. Name a changelist: /p4-change <n>",
+			"info",
+		);
 		return;
 	}
+	await offerReconcile(ws, ctx, source);
 
-	const files = await openedFiles(ws, work);
+	const files = await openedFiles(ws, source);
 	if (files.length === 0) {
-		ctx.ui.notify(`Nothing open in the work changelist ${work}.`, "info");
+		ctx.ui.notify(`Nothing open in changelist ${source}.`, "info");
 		return;
 	}
 	const problems = await readinessProblems(ws, files);
@@ -58,7 +69,7 @@ export async function runChangeCommand(ws: Workspace, args: string, ctx: Extensi
 			ctx.ui.notify(`Not shelving until these are fixed (p4_resolve can help):\n${problems.join("\n")}`, "error");
 			return;
 		}
-		const go = await ctx.ui.confirm("Some files are not ready to submit. Create changelists anyway?", problems.join("\n"));
+		const go = await ctx.ui.confirm("Some files are not ready to submit. Split anyway?", problems.join("\n"));
 		if (!go) return;
 	}
 	if (!ctx.runEphemeralTurn) {
@@ -66,63 +77,78 @@ export async function runChangeCommand(ws: Workspace, args: string, ctx: Extensi
 		return;
 	}
 
-	ctx.ui.setWorkingMessage?.("Drafting changelist descriptions…");
+	const others = pending.filter(c => c.change !== source);
+	ctx.ui.setWorkingMessage?.("Grouping files and drafting descriptions…");
 	let plan: PlannedChange[];
 	try {
-		const prompt = await buildPrompt(ws, files, { single, hint });
+		const prompt = await buildPrompt(ws, files, { single, hint, current: sourceInfo, others });
 		const { replyText } = await ctx.runEphemeralTurn({ promptText: prompt, tools: false, dedupeReply: false, replyMaxBytes: 64_000 });
-		plan = normalizePlan(parsePlan(replyText), files, single);
-		if (startReviews) plan = plan.map(c => ({ ...c, description: withReviewKeyword(c.description, true) }));
+		plan = normalizePlan(parsePlan(replyText), files, single, new Set(others.map(c => c.change)));
+		if (startReviews) plan = plan.map(c => (c.change ? c : { ...c, description: withReviewKeyword(c.description, true) }));
 	} finally {
 		ctx.ui.setWorkingMessage?.();
 	}
 
+	// The first new part keeps the original number, so shelves and reviews on it stay attached.
+	const keeper = plan.find(c => !c.change);
 	const summary = plan
-		.map((c, i) => `#${i + 1} (${c.files.length} file${c.files.length === 1 ? "" : "s"})\n${c.description}\n  ${c.files.join("\n  ")}`)
+		.map((c, i) => {
+			const count = `${c.files.length} file${c.files.length === 1 ? "" : "s"}`;
+			const head = c.change
+				? `#${i + 1} → your changelist ${c.change} "${others.find(o => o.change === c.change)?.desc.split("\n")[0] ?? ""}" (${count})`
+				: `#${i + 1} ${c === keeper ? `stays changelist ${source}` : "new changelist"} (${count})\n${c.description}`;
+			return `${head}\n  ${c.files.join("\n  ")}`;
+		})
 		.join("\n\n");
-	const verb = startReviews ? "Create, shelve and start reviews for" : shelveAfter ? "Create and shelve" : "Create";
-	const ok = await ctx.ui.confirm(`${verb} ${plan.length} pending changelist${plan.length === 1 ? "" : "s"}?`, summary);
+	const verb = startReviews ? "Apply this and start reviews" : shelveAfter ? "Apply this and shelve" : "Apply this split";
+	const ok = await ctx.ui.confirm(`${verb}? (${plan.length} part${plan.length === 1 ? "" : "s"})`, summary);
 	if (!ok) {
-		ctx.ui.notify(`Kept everything in work changelist ${work}.`, "info");
+		ctx.ui.notify(`Kept everything in changelist ${source}.`, "info");
 		return;
 	}
 
-	const created: string[] = [];
-	for (const change of plan) {
-		const number = await createChange(ws, change.description);
-		await reopen(ws, number, change.files);
-		created.push(number);
+	const targets: string[] = [];
+	for (const part of plan) {
+		let target: string;
+		if (part.change) target = part.change;
+		else if (part === keeper) {
+			target = source;
+			if (part.description.trim() !== sourceInfo.desc.trim()) await setDescription(ws, source, part.description);
+			router.recordDescription(ws, source, part.description);
+		} else {
+			target = await router.createFor(ws, part.description);
+		}
+		const moving = part.files.filter(f => files.find(x => x.depotFile === f)?.change !== target);
+		await reopen(ws, target, moving);
+		for (const f of part.files) router.noteLanding(ws, target, files.find(x => x.depotFile === f)?.localPath ?? f, files.find(x => x.depotFile === f)?.action ?? "edit");
+		targets.push(target);
 	}
-	if (shelveAfter) for (const number of created) await shelve(ws, number);
-	const left = await openedFiles(ws, work);
-	if (left.length === 0) {
-		// p4 refuses to delete a changelist that still has shelved files; leave it and keep using it.
-		try {
-			await deleteChange(ws, work);
-			forgetWorkChange(ws);
-		} catch {}
-	}
-	const plural = created.length === 1 ? "" : "s";
+	if (keeper) router.follow(ws, source);
+	if (shelveAfter) for (const target of new Set(targets)) await shelve(ws, target);
+	await router.dropEmpty(ws);
+
+	const list = [...new Set(targets)].join(", ");
 	if (startReviews) {
 		ctx.ui.setWorkingMessage?.("Waiting for P4 Code Review to pick up the shelves…");
-		const reviews = await Promise.all(created.map(n => waitForReview(ws, Number(n)).catch(() => undefined)));
+		const unique = [...new Set(targets)];
+		const reviews = await Promise.all(unique.map(n => waitForReview(ws, Number(n)).catch(() => undefined)));
 		ctx.ui.setWorkingMessage?.();
-		const lines = created.map((n, i) =>
-			reviews[i] ? `change ${n} → review ${reviews[i]!.id} (p4://review/${reviews[i]!.id})` : `change ${n} → shelved with #review; review not visible yet`,
+		const lines = unique.map((n, i) =>
+			reviews[i] ? `change ${n} → review ${reviews[i]!.id} (p4://review/${reviews[i]!.id})` : `change ${n} → shelved; no review yet (its description may lack #review)`,
 		);
 		ctx.ui.notify(`Shelved for review:\n${lines.join("\n")}\nRe-shelve with p4_shelve to update a review after fixes.`, "info");
 		return;
 	}
 	ctx.ui.notify(
 		shelveAfter
-			? `Created and shelved changelist${plural} ${created.join(", ")} for review. Update a shelf after fixes with p4_shelve.`
-			: `Created pending changelist${plural} ${created.join(", ")}. Review with 'p4 describe -du <n>', submit with 'p4 submit -c <n>'.`,
+			? `Shelved changelists ${list}. Update a shelf after fixes with p4_shelve.`
+			: `Split into changelists ${list}. Review with 'p4 describe -du <n>', submit with 'p4 submit -c <n>'.`,
 		"info",
 	);
 }
 
 /** Show what bash or other tools changed outside p4 and offer to open it. */
-async function offerReconcile(ws: Workspace, ctx: ExtensionCommandContext): Promise<void> {
+async function offerReconcile(ws: Workspace, ctx: ExtensionCommandContext, change: string): Promise<void> {
 	const scope = `${ws.cwd}/...`;
 	let preview;
 	try {
@@ -136,13 +162,17 @@ async function offerReconcile(ws: Workspace, ctx: ExtensionCommandContext): Prom
 	if (preview.entries.length === 0) return;
 	const list = preview.entries.map(e => `${e.action.padEnd(8)} ${e.depotFile}`).join("\n");
 	const include = await ctx.ui.confirm(
-		`${preview.entries.length} change${preview.entries.length === 1 ? "" : "s"} not yet opened in p4. Open them in the work changelist?`,
+		`${preview.entries.length} change${preview.entries.length === 1 ? "" : "s"} not yet opened in p4. Open them in changelist ${change}?`,
 		list,
 	);
-	if (include) await reconcile(ws, preview.entries.map(e => e.localPath));
+	if (include) await reconcile(ws, preview.entries.map(e => e.localPath), { change });
 }
 
-async function buildPrompt(ws: Workspace, files: OpenedFile[], options: { single: boolean; hint: string }): Promise<string> {
+async function buildPrompt(
+	ws: Workspace,
+	files: OpenedFile[],
+	options: { single: boolean; hint: string; current: PendingChange; others: PendingChange[] },
+): Promise<string> {
 	const { text: diffs, truncated } = await renderDiffs(ws, files, { maxChars: DIFF_BUDGET_CHARS });
 	const recent = await p4(["changes", "-s", "submitted", "-m", "8", "-l", `${ws.cwd}/...`], { cwd: ws.cwd });
 	const examples = recent.records
@@ -154,12 +184,16 @@ async function buildPrompt(ws: Workspace, files: OpenedFile[], options: { single
 	const template = await readTemplate(ws);
 
 	return [
-		"Write Perforce changelist descriptions for the files below, using what you know from this conversation about why they changed.",
+		`These files are open in Perforce changelist ${options.current.change}, currently described as:\n${options.current.desc || "(no description)"}`,
+		"Write Perforce changelist descriptions for them, using what you know from this conversation about why they changed. Keep a good existing description rather than rewriting it.",
 		options.single
 			? "Put every file in ONE changelist."
 			: "Group the files into one or more changelists. Split only when the changes are clearly independent and each group stands on its own; every file goes in exactly one group. A file cannot be split across changelists.",
+		options.others.length && !options.single
+			? `If a group clearly continues one of the user's other pending changelists, put it there by giving "change" instead of "description":\n${options.others.map(c => `  ${c.change}: ${c.desc.split("\n")[0]}`).join("\n")}`
+			: "",
 		"Reply with JSON only, no prose and no code fence:",
-		'{"changelists":[{"description":"<summary line>\\n\\n<body>","files":["//depot/path", ...]}]}',
+		'{"changelists":[{"description":"<summary line>\\n\\n<body>","files":["//depot/path", ...]}, {"change":"<existing number>","files":[...]}]}',
 		"Use depot paths exactly as listed.",
 		template ? `Follow this description template:\n${template}` : "",
 		examples ? `Match the style of recent submitted changelists here:\n${examples}` : "",
@@ -189,26 +223,38 @@ export function parsePlan(reply: string): PlannedChange[] {
 	const parsed = JSON.parse(reply.slice(start, end + 1)) as { changelists?: unknown };
 	if (!Array.isArray(parsed.changelists)) throw new Error("Model reply is missing 'changelists'.");
 	return parsed.changelists.map(c => {
-		const entry = c as { description?: unknown; files?: unknown };
+		const entry = c as { description?: unknown; files?: unknown; change?: unknown };
+		const change = typeof entry.change === "string" || typeof entry.change === "number" ? String(entry.change) : undefined;
 		return {
 			description: typeof entry.description === "string" ? entry.description : "",
 			files: Array.isArray(entry.files) ? entry.files.filter((f): f is string => typeof f === "string") : [],
+			...(change ? { change } : {}),
 		};
 	});
 }
 
 /**
- * Make the plan safe to apply: drop unknown paths and duplicates, put files the
- * model forgot into the first changelist, drop empty groups.
+ * Make the plan safe to apply: drop unknown paths and duplicates, drop joins into
+ * changelists that are not the user's pending ones, put files the model forgot
+ * into the first group, drop empty groups.
  */
-export function normalizePlan(plan: PlannedChange[], files: OpenedFile[], single: boolean): PlannedChange[] {
+export function normalizePlan(
+	plan: PlannedChange[],
+	files: OpenedFile[],
+	single: boolean,
+	existing: Set<string> = new Set(),
+): PlannedChange[] {
 	const known = new Set(files.map(f => f.depotFile));
 	const seen = new Set<string>();
-	let groups = plan
-		.map(c => ({
-			description: c.description.trim() || "Changes made with omp",
-			files: c.files.filter(f => known.has(f) && !seen.has(f) && seen.add(f)),
-		}))
+	let groups: PlannedChange[] = plan
+		.map(c => {
+			const join = !single && c.change && existing.has(c.change) ? c.change : undefined;
+			return {
+				description: c.description.trim() || "Changes made with omp",
+				files: c.files.filter(f => known.has(f) && !seen.has(f) && seen.add(f)),
+				...(join ? { change: join } : {}),
+			};
+		})
 		.filter(c => c.files.length > 0);
 	if (groups.length === 0) groups = [{ description: plan[0]?.description.trim() || "Changes made with omp", files: [] }];
 	const missing = [...known].filter(f => !seen.has(f));

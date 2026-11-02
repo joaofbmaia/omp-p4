@@ -1,10 +1,9 @@
 /**
- * Perforce workspace discovery and the agent's "work" pending changelist.
+ * Perforce workspace discovery and the p4 operations the extension runs.
  *
- * Everything the agent opens goes into one numbered pending changelist per
- * client (tagged {@link WORK_TAG}), so its changes never mix with files you
- * already have open in the default or other changelists. `/p4-change` later
- * splits that changelist into real ones.
+ * Every operation that opens files takes the pending changelist to open them in;
+ * which changelist that is (yours, or one the agent created) is decided in
+ * changes.ts.
  */
 import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
@@ -13,8 +12,8 @@ import * as path from "node:path";
 import { hasGitMarkers, hasP4Markers, p4MarkersToGit } from "./markers";
 import { isLoginError, isTrustError, P4Error, p4, p4Strict } from "./p4";
 
-export const WORK_TAG = "[omp-work]";
-const WORK_DESCRIPTION = `${WORK_TAG} Files opened by the omp agent. Split with /p4-change before submitting.`;
+/** Marks the extension's part of the system prompt, so it can be replaced each prompt. */
+export const NOTE_TAG = "[omp-p4]";
 
 export interface Workspace {
 	client: string;
@@ -47,9 +46,6 @@ export interface OpenedFile {
 const workspaceCache = new Map<string, { pending: Promise<Workspace | null>; expires: number }>();
 const NOT_A_CLIENT_TTL_MS = 5 * 60_000;
 const RETRY_AFTER_MS = 30_000;
-const workChangeCache = new Map<string, Promise<string>>();
-/** Clients known to have no work changelist yet, until when (a session in git files must not ask every prompt). */
-const noWorkChangeUntil = new Map<string, number>();
 
 /** Workspaces detected so far, to answer subdirectories without another `p4 info`. */
 const knownWorkspaces: Workspace[] = [];
@@ -125,43 +121,22 @@ export function isUnder(file: string, root: string): boolean {
 	return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
-/** Number of the agent's work changelist, creating it on first use. */
-export function workChange(ws: Workspace): Promise<string> {
-	let pending = workChangeCache.get(ws.client);
-	if (!pending) {
-		pending = findOrCreateWorkChange(ws);
-		workChangeCache.set(ws.client, pending);
-		pending.catch(() => workChangeCache.delete(ws.client));
-	}
-	return pending;
+export interface PendingChange {
+	change: string;
+	/** Full description. */
+	desc: string;
 }
 
-/** The work changelist if it already exists; never creates one (for read-only paths). */
-export async function existingWorkChange(ws: Workspace): Promise<string | undefined> {
-	const cached = workChangeCache.get(ws.client);
-	if (cached) return cached;
-	if (Date.now() < (noWorkChangeUntil.get(ws.client) ?? 0)) return undefined;
-	const found = await findWorkChange(ws);
-	if (found) workChangeCache.set(ws.client, Promise.resolve(found));
-	else noWorkChangeUntil.set(ws.client, Date.now() + NOT_A_CLIENT_TTL_MS);
-	return found;
+/** This client's pending changelists, newest first. */
+export async function pendingChanges(ws: Workspace): Promise<PendingChange[]> {
+	const { records } = await p4Strict(["changes", "-s", "pending", "-c", ws.client, "-l"], { cwd: ws.cwd });
+	return records.filter(r => r.change).map(r => ({ change: r.change, desc: (r.desc ?? "").trim() }));
 }
 
-async function findWorkChange(ws: Workspace): Promise<string | undefined> {
-	const { records } = await p4Strict(["changes", "-s", "pending", "-c", ws.client, "-u", ws.user, "-l"], {
-		cwd: ws.cwd,
-	});
-	return records.find(r => r.desc?.includes(WORK_TAG))?.change;
-}
-
-/** Forget the cached work changelist (after `/p4-change` deletes it). */
-export function forgetWorkChange(ws: Workspace): void {
-	workChangeCache.delete(ws.client);
-	noWorkChangeUntil.delete(ws.client);
-}
-
-async function findOrCreateWorkChange(ws: Workspace): Promise<string> {
-	return (await findWorkChange(ws)) ?? createChange(ws, WORK_DESCRIPTION);
+/** Whether a p4 error says the changelist is gone or no longer pending (submitted, deleted, someone else's). */
+export function isStaleChangeError(err: unknown): boolean {
+	const text = err instanceof P4Error ? [...err.result.errors, ...err.result.warnings].join("\n") : String(err);
+	return /change \d+ unknown|unknown change|no such changelist|already committed|belongs to (client|user)|is not a pending/i.test(text);
 }
 
 /** Create an empty numbered pending changelist and return its number. */
@@ -202,14 +177,33 @@ export async function openedFiles(ws: Workspace, change?: string): Promise<Opene
 		}));
 }
 
+/** Which of `files` are open on this client, and in which changelist (one fstat). */
+export async function openedState(ws: Workspace, files: string[]): Promise<Map<string, OpenedFile>> {
+	const state = new Map<string, OpenedFile>();
+	if (files.length === 0) return state;
+	const result = await p4(["fstat", ...files], { cwd: ws.cwd });
+	for (const r of result.records) {
+		if (!r.clientFile || !r.action) continue;
+		state.set(r.clientFile, {
+			depotFile: r.depotFile,
+			localPath: r.clientFile,
+			action: r.action,
+			change: r.change ?? "default",
+			type: r.type,
+			movedFile: r.movedFile,
+			unresolved: "unresolved" in r,
+		});
+	}
+	return state;
+}
+
 /**
- * Open an existing depot file for edit in the work changelist and confirm it
- * became writable. Throws with p4's own message otherwise (exclusive lock held
+ * Open an existing depot file for edit in pending changelist `change` and confirm
+ * it became writable. Throws with p4's own message otherwise (exclusive lock held
  * elsewhere, file not in the client view, not on the client, …). Returns the
  * warnings worth telling the agent about: not at head, also opened elsewhere.
  */
-export async function openForEdit(ws: Workspace, file: string): Promise<string[]> {
-	const change = await workChange(ws);
+export async function openForEdit(ws: Workspace, file: string, change: string): Promise<string[]> {
 	const result = await p4Strict(["edit", "-c", change, file], { cwd: ws.cwd });
 	const writable = await fs.access(file, fsConstants.W_OK).then(
 		() => true,
@@ -222,9 +216,8 @@ export async function openForEdit(ws: Workspace, file: string): Promise<string[]
 	return result.warnings.filter(w => /must (sync|resolve)|not.*head|also opened|out of date/i.test(w));
 }
 
-/** Open a depot file for delete in the work changelist (p4 removes the local copy). */
-export async function openForDelete(ws: Workspace, file: string): Promise<void> {
-	const change = await workChange(ws);
+/** Open a depot file for delete in `change` (p4 removes the local copy). */
+export async function openForDelete(ws: Workspace, file: string, change: string): Promise<void> {
 	await p4Strict(["delete", "-c", change, file], { cwd: ws.cwd });
 }
 
@@ -236,16 +229,15 @@ export interface ReconcileEntry {
 
 /**
  * Open adds/edits/deletes the agent made without going through p4 (new files,
- * deletes, moves, bash writes) in the work changelist. `preview` lists them only.
+ * deletes, moves, bash writes) in `change`. `preview` lists them only.
  */
 export async function reconcile(
 	ws: Workspace,
 	paths: string[],
-	options: { preview?: boolean; timeoutMs?: number } = {},
+	options: { preview?: boolean; change?: string; timeoutMs?: number } = {},
 ): Promise<{ entries: ReconcileEntry[]; warnings: string[] }> {
 	if (paths.length === 0) return { entries: [], warnings: [] };
-	// A preview opens nothing, so it must not create the work changelist either.
-	const target = options.preview ? ["-n"] : ["-c", await workChange(ws)];
+	const target = options.preview ? ["-n"] : options.change ? ["-c", options.change] : [];
 	const args = ["reconcile", ...target, ...paths];
 	const result = await p4Strict(args, { cwd: ws.cwd, timeoutMs: options.timeoutMs ?? 60_000 });
 	// The generated .ignore (see ignore-sync.ts) is local tooling, never depot content.
@@ -314,15 +306,15 @@ export async function shelve(ws: Workspace, change: string): Promise<string[]> {
 }
 
 /**
- * Unshelve `shelf` (yours or someone else's) into the work changelist. Files
- * already open here are scheduled for resolve rather than overwritten.
+ * Unshelve `shelf` (yours or someone else's) into pending changelist `change`.
+ * Files already open here are scheduled for resolve rather than overwritten.
  */
 export async function unshelve(
 	ws: Workspace,
 	shelf: string,
+	change: string,
 	files: string[] = [],
 ): Promise<{ opened: string[]; warnings: string[] }> {
-	const change = await workChange(ws);
 	const result = await p4Strict(["unshelve", "-s", shelf, "-c", change, ...files], { cwd: ws.cwd, timeoutMs: 120_000 });
 	return {
 		opened: result.records.filter(r => r.depotFile).map(r => `${r.action ?? "unshelved"} ${r.depotFile}`),

@@ -19,11 +19,11 @@ import { ignoreState } from "../src/ignore-sync";
 import { p4 } from "../src/p4";
 import { changeDiff } from "../src/review";
 import { classifyRoot, groupByWorkspace, p4OwnsPath } from "../src/roots";
-import { applyRestore, planRestore, takeSnapshot } from "../src/snapshots";
+import { ChangeRouter, findChange } from "../src/changes";
+import { applyRestore, captureFiles, planIsEmpty, planRestore, takeSnapshot } from "../src/snapshots";
 import {
 	convertMarkersToGit,
 	createChange,
-	existingWorkChange,
 	findWorkspace,
 	openedFiles,
 	openForEdit,
@@ -35,7 +35,6 @@ import {
 	shelve,
 	unshelve,
 	type Workspace,
-	workChange,
 } from "../src/workspace";
 
 const has = (bin: string) => Bun.which(bin) !== null;
@@ -45,6 +44,9 @@ const HAS_OMP = fs.existsSync(path.join(OMP_SRC, "internal-urls/router.ts"));
 
 let base = "";
 let wsA: Workspace;
+/** The agent's changelist for these tests (what the router creates on first use). */
+let work = "";
+const router = new ChangeRouter();
 /** Number of the "top v2" change B submits. */
 let topV2 = "";
 const a = (...p: string[]) => path.join(base, "a", ...p);
@@ -126,20 +128,23 @@ describe.skipIf(!LIVE)("live Perforce server", () => {
 		wsA = ws;
 	});
 
-	test("detects the client; the work changelist is only created when needed", async () => {
+	test("detects the client; a changelist for the task is only created when needed", async () => {
 		expect(wsA.client).toBe("client_a");
 		expect(wsA.root).toBe(a());
-		expect(await existingWorkChange(wsA)).toBeUndefined();
-		const work = await workChange(wsA);
+		router.startPrompt("deepen the fifo\nand more");
+		expect(router.current(wsA)).toBeUndefined();
+		work = await router.target(wsA);
 		expect(work).toMatch(/^\d+$/);
-		expect(await existingWorkChange(wsA)).toBe(work);
+		expect(router.current(wsA)).toBe(work);
+		expect(router.isCreated(wsA, work)).toBe(true);
+		expect(router.description(work)).toBe("Deepen the fifo");
 	});
 
-	test("synced files are read-only; openForEdit checks out into the work changelist", async () => {
+	test("synced files are read-only; openForEdit checks out into the given changelist", async () => {
 		expect(writable(a("rtl/fifo.sv"))).toBe(false);
-		expect(await openForEdit(wsA, a("rtl/fifo.sv"))).toEqual([]);
+		expect(await openForEdit(wsA, a("rtl/fifo.sv"), work)).toEqual([]);
 		expect(writable(a("rtl/fifo.sv"))).toBe(true);
-		const opened = await openedFiles(wsA, await workChange(wsA));
+		const opened = await openedFiles(wsA, work);
 		expect(opened.map(f => [f.action, f.depotFile])).toEqual([["edit", "//depot/rtl/fifo.sv"]]);
 	});
 
@@ -147,7 +152,7 @@ describe.skipIf(!LIVE)("live Perforce server", () => {
 		await asB(["edit", "rtl/top.sv"]);
 		fs.writeFileSync(b("rtl/top.sv"), "module top;\n  // v2\nendmodule\n");
 		topV2 = /Change (\d+) submitted/.exec(await asB(["submit", "-d", "top v2"]))![1];
-		const warnings = await openForEdit(wsA, a("rtl/top.sv"));
+		const warnings = await openForEdit(wsA, a("rtl/top.sv"), work);
 		expect(warnings.join("\n")).toMatch(/must sync\/resolve/);
 		await p4(["revert", a("rtl/top.sv")], { cwd: a(), tagged: false });
 		await p4(["sync"], { cwd: a(), tagged: false });
@@ -159,7 +164,7 @@ describe.skipIf(!LIVE)("live Perforce server", () => {
 		fs.writeFileSync(a("tools/gen/src/gen.py"), "print('hi')\n");
 		const groups = await groupByWorkspace(fakeCtx(a()), [a("rtl/new.sv"), a("tools/gen/src/gen.py")]);
 		expect([...groups.values()].flatMap(g => g.files)).toEqual([a("rtl/new.sv")]);
-		const { entries } = await reconcile(wsA, [a("rtl/new.sv")]);
+		const { entries } = await reconcile(wsA, [a("rtl/new.sv")], { change: work });
 		expect(entries.map(e => e.action)).toEqual(["add"]);
 		expect(p4OwnsPath(wsA, a("tools/gen/.git/config"))).toBe(false);
 		expect((await classifyRoot(a("tools/gen"))).kind).toBe("git");
@@ -167,7 +172,7 @@ describe.skipIf(!LIVE)("live Perforce server", () => {
 
 	test("diffs use git-style headers for edits and adds", async () => {
 		fs.writeFileSync(a("rtl/fifo.sv"), "module fifo (\n  parameter DEPTH = 16\n);\nendmodule\n");
-		const opened = await openedFiles(wsA, await workChange(wsA));
+		const opened = await openedFiles(wsA, work);
 		const edit = await diffOpenedFile(wsA, opened.find(f => f.action === "edit")!);
 		expect(edit).toStartWith("diff --git a/rtl/fifo.sv b/rtl/fifo.sv\n--- a/rtl/fifo.sv\n+++ b/rtl/fifo.sv\n@@");
 		expect(edit).toContain("-  parameter DEPTH = 8\n+  parameter DEPTH = 16");
@@ -176,18 +181,57 @@ describe.skipIf(!LIVE)("live Perforce server", () => {
 	});
 
 	test("rewind snapshots restore content and revert files opened later", async () => {
-		const snapshot = (await takeSnapshot(wsA))!;
+		const snapshot = await takeSnapshot(wsA);
+		await captureFiles(snapshot, [a("rtl/fifo.sv"), a("rtl/later.sv")]);
 		fs.writeFileSync(a("rtl/fifo.sv"), "module fifo (\n  parameter DEPTH = 99\n);\nendmodule\n");
 		fs.writeFileSync(a("rtl/later.sv"), "module later;\nendmodule\n");
-		await reconcile(wsA, [a("rtl/later.sv")]);
+		await reconcile(wsA, [a("rtl/later.sv")], { change: work });
 		const plan = await planRestore(wsA, snapshot);
 		expect(plan.revert.map(f => f.depotFile)).toEqual(["//depot/rtl/later.sv"]);
 		expect(plan.rewrite.map(r => r.path)).toEqual([a("rtl/fifo.sv")]);
 		await applyRestore(wsA, plan);
 		expect(read(a("rtl/fifo.sv"))).toContain("DEPTH = 16");
 		expect(fs.existsSync(a("rtl/later.sv"))).toBe(false);
-		const again = await planRestore(wsA, snapshot);
-		expect(again.revert.length + again.rewrite.length).toBe(0);
+		expect(planIsEmpty(await planRestore(wsA, snapshot))).toBe(true);
+	});
+
+	test("rewind also covers files in the user's own changelists and moves between changelists", async () => {
+		// The user has top.sv open in their own changelist.
+		const mine = await createChange(wsA, "My ALU cleanup");
+		await openForEdit(wsA, a("rtl/top.sv"), mine);
+		fs.writeFileSync(a("rtl/top.sv"), "module top;\n  // mine\nendmodule\n");
+		const snapshot = await takeSnapshot(wsA);
+		await captureFiles(snapshot, [a("rtl/top.sv")]);
+		// The agent edits it (it stays in the user's changelist) and moves fifo.sv over too.
+		fs.writeFileSync(a("rtl/top.sv"), "module top;\n  // agent\nendmodule\n");
+		await reopen(wsA, mine, ["//depot/rtl/fifo.sv"]);
+		const plan = await planRestore(wsA, snapshot);
+		expect(plan.rewrite.map(r => r.path)).toEqual([a("rtl/top.sv")]);
+		expect(plan.move.map(m => [m.file.depotFile, m.to])).toEqual([["//depot/rtl/fifo.sv", work]]);
+		await applyRestore(wsA, plan);
+		expect(read(a("rtl/top.sv"))).toContain("// mine");
+		const opened = await openedFiles(wsA);
+		expect(opened.find(f => f.depotFile === "//depot/rtl/fifo.sv")?.change).toBe(work);
+		expect(opened.find(f => f.depotFile === "//depot/rtl/top.sv")?.change).toBe(mine);
+		await p4(["revert", a("rtl/top.sv")], { cwd: a(), tagged: false });
+		await p4(["change", "-d", mine], { cwd: a(), tagged: false });
+	});
+
+	test("routing: new files follow the user's changelist; changelists are found by their words; empty ones go", async () => {
+		const mine = await createChange(wsA, "ALU: add saturating adds");
+		await openForEdit(wsA, a("rtl/top.sv"), mine);
+		router.follow(wsA, mine);
+		expect(await router.target(wsA)).toBe(mine);
+		const found = await findChange(wsA, "the saturating alu one");
+		expect("change" in found && found.change).toBe(mine);
+		await expect(findChange(wsA, "1")).rejects.toThrow(/already submitted/);
+		// A changelist created for a task that never gets files is deleted at the end of the prompt.
+		const spare = await router.createFor(wsA, "Spare");
+		expect(await router.dropEmpty(wsA)).toEqual([spare]);
+		expect(router.current(wsA)).toBeUndefined();
+		await p4(["revert", a("rtl/top.sv")], { cwd: a(), tagged: false });
+		await p4(["change", "-d", mine], { cwd: a(), tagged: false });
+		router.follow(wsA, work);
 	});
 
 	test("new changelists, shelving (first time with -r) and shelf diffs", async () => {
@@ -210,7 +254,7 @@ describe.skipIf(!LIVE)("live Perforce server", () => {
 		await asB(["reopen", "-c", shelf, "rtl/fifo.sv"]);
 		await asB(["shelve", "-c", shelf]);
 
-		const { warnings } = await unshelve(wsA, shelf, ["//depot/rtl/fifo.sv"]);
+		const { warnings } = await unshelve(wsA, shelf, work, ["//depot/rtl/fifo.sv"]);
 		expect(warnings.join("\n")).toMatch(/must resolve/);
 		const pending = await pendingResolves(wsA);
 		expect(pending).toHaveLength(1);

@@ -63,10 +63,9 @@ describe.skipIf(!ENABLED)("live P4 Code Review server", () => {
 		await p4Strict(["submit", "-d", `omp-p4 live review test ${run}`], { cwd: root });
 		depotFile = `//depot/omp-p4-test/${run}/fifo.sv`;
 
-		await openForEdit(ws, file);
-		fs.writeFileSync(file, "module fifo (\n  parameter DEPTH = 16\n);\nendmodule\n");
 		change = await createChange(ws, `Deepen FIFO (${run})`);
-		await reopen(ws, change, [depotFile]);
+		await openForEdit(ws, file, change);
+		fs.writeFileSync(file, "module fifo (\n  parameter DEPTH = 16\n);\nendmodule\n");
 	});
 
 	test("#review + shelve starts a review (the team flow); found by change and by id", async () => {
