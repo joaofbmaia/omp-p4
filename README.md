@@ -8,9 +8,9 @@ Outside a Perforce client, or on a machine without `p4`, it does nothing.
 
 **Check-out on write.** Depot files are read-only until opened. When omp's `edit` or `write` tool fails with a permission error on one of them, the extension runs `p4 edit` and retries the write. If the check-out fails (exclusive lock held by someone else, file outside the client view), the write fails and the agent is told why. If the file isn't at the head revision, or is open somewhere else, the agent is told that too, so it doesn't build on stale code without saying so.
 
-**Adds, deletes and moves.** Files that `edit`/`write` created, removed or moved are opened with a single `p4 reconcile` at the end of each turn, rather than one server round trip per edit. Anything that needs p4 to be current (the tools below, `/p4-change`, rewind snapshots) reconciles first. Files covered by your P4IGNORE are skipped.
+**Adds and deletes are the agent's call.** Not every file the agent writes belongs in the depot: scratch scripts, notes and generated output don't. So new and deleted files are not opened automatically. The first time `edit` or `write` creates or deletes a file inside a client, the agent is told ("`rtl/x.sv` is new and not in Perforce"), and it opens what belongs in the change with `p4_reconcile`. That notice costs no p4 call: the extension knows from the file system whether the file existed before the tool ran. Changes made by bash are the agent's to open the same way. `/p4-change` still previews `p4 reconcile -n` and offers whatever was left out.
 
-**Files changed by bash.** After a bash command that looks like it writes files (redirects, `mv`/`cp`/`rm`, `sed -i`, scripts and generators; not `grep` or `ls`), a quick `p4 reconcile -n` of the command's folder and the paths it names shows what Perforce doesn't know about yet. The agent is told and decides what belongs in the change; nothing is opened automatically, because build outputs belong in P4IGNORE rather than the changelist.
+**Edits never wait on p4.** Editing a file that is already open makes no p4 call on the agent's side. Which changelist the file is in (for routing, the footer and the end-of-prompt line) is looked up in the background.
 
 ## Changelists
 
@@ -33,18 +33,19 @@ you:   send both for review
 ```
 
 - **Perforce is the record.** A file that is already open stays in its changelist. The extension keeps no separate idea of what belongs where.
-- **New files follow the work.** A file the agent checks out, creates or deletes goes to the changelist of the file it last edited. The destination is decided when the file is written, so switching changelists later doesn't reroute it. With nothing to follow, a changelist is created for the task when the first file needs it, with your prompt as a provisional description. The agent is asked to replace that with a real one, in the style of your recent submits, once the work in it is done. Nothing ever goes into the default changelist.
+- **New files follow the work.** A file the agent checks out or opens with `p4_reconcile` goes to the changelist of the file it last edited. With nothing to follow, a changelist is created for the task when the first file needs it, with your prompt as a provisional description. The agent is asked to replace that with a real one, in the style of your recent submits, once the work in it is done. Nothing ever goes into the default changelist.
 - **You steer in words.** "New CL for this", "put it in my fifo CL", "move alu_tb to 4720", "rename that CL" all work through the `p4_change` tool, which finds a changelist by number or by words from its description. Moving files between pending changelists is reversible, so it's reported rather than confirmed. Files the agent just created can be "moved" too: they're opened directly in the named changelist.
 - **Your descriptions are yours.** The agent rewrites the descriptions of changelists it created without asking. These are remembered across sessions in `~/.omp/agent/omp-p4.json`, together with the description the agent last set. Once you edit one by hand it counts as yours, and changing it asks you first. In headless runs the agent refuses and asks you in its reply instead.
 - **Tidy by default.** Changelists the agent created that end up empty are deleted; ones with shelves are kept.
 - **One file, one changelist.** Perforce allows a file in only one pending changelist. If a file needs changes for two separate pieces of work, the agent is told to say so rather than mix them.
 - **Shown, not asked.** The footer lists the changelists in play (`p4 · 4711 fifo depth (3) · 4730 alu tb (2)`). A one-line summary appears at the end of a prompt, but only when work went somewhere new. The agent's instructions list the session's changelists too, so "shelve both for review" works without numbers.
 
-**Rewind restores everything.** At the first change of each prompt, the extension records which files are open on the client and in which changelist (one `p4 fstat`). Then each file's content is copied into memory just before its first change. `edit` and `write` name their files; before `bash`, every open file is copied. Prompts that change nothing cost nothing. When you rewind with `/branch`, you're offered to put things back as they were at that message, across every changelist:
+**Rewind restores everything.** At the first change of each prompt, the extension records which files are open on the client and in which changelist (one `p4 fstat`). Then each file's content is copied into memory just before its first change. `edit` and `write` name their files; before `bash`, the files open in the session's changelists are copied. Copying stops after 3 s, since a copy taken after the tool starts could hold half-written output. Prompts that change nothing cost nothing. When you rewind with `/branch`, you're offered to put things back as they were at that message, across every changelist:
 - files opened later are reverted (added files are removed);
 - old contents are written back;
 - files moved between changelists go back;
 - deleted or reverted files are reopened in their old changelist.
+- files the agent created without opening them are removed, and unopened files it changed get their old content back.
 
 The snapshots are local only; nothing is shelved. They last for the omp session, and content beyond 64 MB per prompt isn't kept.
 
@@ -55,6 +56,8 @@ The snapshots are local only; nothing is shelved. They last for the omp session,
 **Transcript.** The p4 tools render like omp's own: a one-line summary collapsed (files and +/- counts, opened files by action, resolves left, a review's state and open tasks), and the full output expanded. Diffs use omp's own diff renderer, with word-level highlighting.
 
 **Messages.** Expired tickets ("run `p4 login`") and untrusted SSL servers ("check the fingerprint and run `p4 trust`"; the extension never trusts a server for you) are reported as such, instead of the extension silently doing nothing. In headless `omp -p` runs, messages go to stderr.
+
+**Slow servers and site wrappers.** omp gives up on an extension handler after 30 s, so every handler here waits on p4 for at most 10 s. Past that, the work carries on in the background, and you're told once that Perforce is slow (with a pointer to `OMP_P4_TRACE`). Each p4 call runs in its own process group, and a call that times out is killed along with anything it started. Without that, a site `p4` wrapper script would leave the real p4 running, and the extension would keep waiting for its output.
 
 **Server round trips.** Only `p4 info` blocks startup; the footer and autocomplete data load in the background, and autocomplete refreshes at most every five minutes. Writing to new folders inside a known workspace doesn't repeat `p4 info`. One small task (edit a read-only file, create a file in a new folder) went from 22 p4 calls to 11. Set `OMP_P4_TRACE=<file>` to log every p4 call with its duration.
 
@@ -191,7 +194,6 @@ Type-checked against omp 18.13.3 and 18.15.0. It loads in omp's RPC mode with al
   - **SSL servers:** untrusted fingerprints are reported, and everything works once trusted.
   - **Tickets expiring mid-session.**
   - **Large changelists:** 2,000 files in 0.3 s locally.
-  - **Bash changes:** files a command changed are detected, without scanning unrelated folders.
 
   The server uses an `rsh:` port (p4d starts per command, so no daemon and no open port) in a temp folder, with `P4CONFIG`, `P4TICKETS` and `P4ENVIRO` pointed there. A real Perforce setup in your environment is never touched. Recent servers require the first user to have a password, so the tests give the throwaway user a random one and log in; it's never printed or stored.
 
@@ -220,7 +222,7 @@ Type-checked against omp 18.13.3 and 18.15.0. It loads in omp's RPC mode with al
 
 ## Known gaps
 
-- Files changed by bash are reported to the agent, not opened automatically; a command that writes outside its own folder without naming the path isn't seen until `/p4-change`.
+- New and deleted files are opened only when the agent decides to. If it forgets one, `/p4-change`'s reconcile preview or a `p4 reconcile -n` finds it before submit.
 - Formatter writes made by an LSP subprocess, such as Biome's, bypass omp's write hook. Run `/p4-change` or `p4 reconcile` afterwards.
 - Concurrent omp sessions on the same client each create their own changelists; they don't know about each other's until a file is open in one.
 - In headless `omp -p` runs, a changelist the agent created but never put a file in can be left behind, since the process exits right after the prompt.

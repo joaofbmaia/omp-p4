@@ -214,30 +214,3 @@ describe.skipIf(!LIVE)("large changelists", () => {
 		for (const ms of Object.values(timings)) expect(ms).toBeLessThan(30_000);
 	}, 180_000);
 });
-
-describe.skipIf(!LIVE)("files changed by bash", () => {
-	const s = useServer();
-
-	test("finds what a command changed in its folder and the paths it names, not elsewhere", async () => {
-		const { server } = s;
-		const dir = await server.client("bash_ws");
-		write(path.join(dir, "rtl/fifo.sv"), "module fifo;\nendmodule\n");
-		await server.run(dir, ["add", "rtl/fifo.sv"]);
-		await server.run(dir, ["submit", "-d", "seed"]);
-		const ws = (await findWorkspace(dir))!;
-		const { scanTargets, unopenedChanges } = await import("../src/bash-watch");
-
-		// What `sed -i … rtl/fifo.sv && python gen.py --out gen/regs.sv && touch rtl/new.sv` would leave behind.
-		const fifo = path.join(dir, "rtl/fifo.sv");
-		fs.chmodSync(fifo, 0o644);
-		write(fifo, "module fifo;\n  // sed\nendmodule\n");
-		write(path.join(dir, "gen/regs.sv"), "// generated\n");
-		write(path.join(dir, "rtl/new.sv"), "module n;\nendmodule\n");
-		write(path.join(dir, "elsewhere/deep/untouched.sv"), "// not named by the command\n");
-
-		const command = "sed -i s/x/y/ fifo.sv && python ../gen.py --out ../gen/regs.sv && touch new.sv";
-		const targets = scanTargets(ws, command, path.join(dir, "rtl"));
-		const found = (await unopenedChanges(ws, targets)).map(c => `${c.action} ${c.depotFile}`).sort();
-		expect(found).toEqual(["add //depot/gen/regs.sv", "add //depot/rtl/new.sv", "edit //depot/rtl/fifo.sv"]);
-	});
-});

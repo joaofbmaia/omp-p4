@@ -195,6 +195,23 @@ describe.skipIf(!LIVE)("live Perforce server", () => {
 		expect(planIsEmpty(await planRestore(wsA, snapshot))).toBe(true);
 	});
 
+	test("rewind removes files the agent created without opening them, and restores unopened ones it changed", async () => {
+		const scratch = a("rtl/scratch_notes.txt");
+		const untracked = a("rtl/local.cfg");
+		fs.writeFileSync(untracked, "keep me\n");
+		const snapshot = await takeSnapshot(wsA);
+		await captureFiles(snapshot, [scratch, untracked]);
+		fs.writeFileSync(scratch, "agent notes\n");
+		fs.writeFileSync(untracked, "changed by the agent\n");
+		const plan = await planRestore(wsA, snapshot);
+		expect(plan.remove).toEqual([scratch]);
+		expect(plan.unopened.map(u => u.path)).toEqual([untracked]);
+		await applyRestore(wsA, plan);
+		expect(fs.existsSync(scratch)).toBe(false);
+		expect(read(untracked)).toBe("keep me\n");
+		fs.rmSync(untracked);
+	});
+
 	test("rewind also covers files in the user's own changelists and moves between changelists", async () => {
 		// The user has top.sv open in their own changelist.
 		const mine = await createChange(wsA, "My ALU cleanup");

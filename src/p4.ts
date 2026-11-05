@@ -17,6 +17,8 @@ export interface P4Result {
 	/** Raw stdout, for untagged commands (`diff`, `print`, `change -i`). */
 	stdout: string;
 	exitCode: number;
+	/** p4 did not finish within its timeout and was killed (with anything it started). */
+	timedOut?: boolean;
 }
 
 export interface P4Options {
@@ -45,20 +47,40 @@ export async function p4(args: string[], options: P4Options): Promise<P4Result> 
 	const tagged = options.tagged ?? true;
 	const argv = ["p4", ...(tagged ? ["-ztag", "-Mj"] : []), ...(options.globals ?? []), ...args];
 	// p4 trusts $PWD over the real cwd on Unix when resolving P4CONFIG and relative paths.
+	// Its own process group: `p4` is often a site wrapper script, and killing only the
+	// wrapper would leave the real p4 running with our pipes open (so we'd keep waiting).
 	const proc = Bun.spawn(argv, {
 		cwd: options.cwd,
 		env: { ...process.env, PWD: options.cwd },
 		stdin: options.stdin === undefined ? "ignore" : Buffer.from(options.stdin),
 		stdout: "pipe",
 		stderr: "pipe",
+		detached: process.platform !== "win32",
 	});
 	const started = performance.now();
-	const timer = setTimeout(() => proc.kill(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-	const [stdout, stderr, exitCode] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-		proc.exited,
-	]).finally(() => clearTimeout(timer));
+	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const expired = new Promise<"timeout">(resolve => {
+		timer = setTimeout(() => {
+			killTree(proc);
+			resolve("timeout");
+		}, timeoutMs);
+	});
+	const finished = Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+	const outcome = await Promise.race([finished, expired]).finally(() => clearTimeout(timer));
+	if (outcome === "timeout") {
+		finished.catch(() => {}); // the killed process's pipes close on their own
+		trace(argv, started, " (timed out)");
+		return {
+			records: [],
+			warnings: [],
+			errors: [`p4 ${args[0]} did not answer within ${Math.round(timeoutMs / 1000)} s`],
+			stdout: "",
+			exitCode: -1,
+			timedOut: true,
+		};
+	}
+	const [stdout, stderr, exitCode] = outcome;
 
 	const result: P4Result = { records: [], warnings: [], errors: [], stdout, exitCode };
 	trace(argv, started);
@@ -83,13 +105,22 @@ export async function p4(args: string[], options: P4Options): Promise<P4Result> 
 	return result;
 }
 
+/** Kill p4 and everything it started (its process group). */
+function killTree(proc: { pid: number; kill(signal?: number): void }): void {
+	try {
+		process.kill(-proc.pid, "SIGKILL");
+	} catch {
+		proc.kill(9);
+	}
+}
+
 /** With OMP_P4_TRACE=<file>, append one line per p4 call (duration, args) for latency work. */
-function trace(argv: string[], started: number): void {
+function trace(argv: string[], started: number, note = ""): void {
 	const file = process.env.OMP_P4_TRACE;
 	if (!file) return;
 	const ms = Math.round(performance.now() - started);
 	const args = argv.slice(1).filter(a => a !== "-ztag" && a !== "-Mj").map(a => (a.length > 60 ? `${a.slice(0, 57)}...` : a));
-	require("node:fs").appendFileSync(file, `${new Date().toISOString()} ${String(ms).padStart(5)}ms p4 ${args.join(" ")}\n`);
+	require("node:fs").appendFileSync(file, `${new Date().toISOString()} ${String(ms).padStart(5)}ms p4 ${args.join(" ")}${note}\n`);
 }
 
 /** Like {@link p4}, but throws when the server reported an error or the process failed. */

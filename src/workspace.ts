@@ -181,7 +181,7 @@ export async function openedFiles(ws: Workspace, change?: string): Promise<Opene
 export async function openedState(ws: Workspace, files: string[]): Promise<Map<string, OpenedFile>> {
 	const state = new Map<string, OpenedFile>();
 	if (files.length === 0) return state;
-	const result = await p4(["fstat", ...files], { cwd: ws.cwd });
+	const result = await p4(["fstat", ...files], { cwd: ws.cwd, timeoutMs: 10_000 });
 	for (const r of result.records) {
 		if (!r.clientFile || !r.action) continue;
 		state.set(r.clientFile, {

@@ -2,7 +2,8 @@
  * omp-p4: Perforce support for oh-my-pi.
  *
  * - Check-out on write: `edit`/`write` on a read-only depot file runs `p4 edit` and retries.
- * - Adds, deletes and moves made by `edit`/`write` are reconciled once per turn.
+ * - New and deleted files are not opened automatically: the agent is told once and opens
+ *   what belongs in the change with p4_reconcile (scratch and generated files stay out).
  * - Files already open stay in their changelist; new ones follow the file last edited
  *   (or go to a changelist created for the task). See src/changes.ts.
  * - Shelves, resolves (through omp's conflict:// flow) and P4 Code Review comments.
@@ -15,7 +16,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { mayWriteFiles, scanTargets, unopenedChanges } from "./src/bash-watch";
+import * as fsSync from "node:fs";
 import { runChangeCommand } from "./src/change-plan";
 import { ChangeRouter, findChange, firstLine } from "./src/changes";
 import { renderDiffs } from "./src/diff";
@@ -95,6 +96,24 @@ const P4_TOOLS = [
 	"p4_review_task",
 ];
 const DIFF_TOOL_BUDGET_CHARS = 120_000;
+/**
+ * Event handlers wait on p4 at most this long; omp gives up on a handler at 30 s. Past
+ * it the work carries on in the background and the user is told Perforce is slow.
+ */
+const HOOK_BUDGET_MS = 10_000;
+/** How long a rewind snapshot may spend copying file contents before a tool runs. */
+const SNAPSHOT_COPY_MS = 3_000;
+
+const TIMED_OUT = Symbol("timed out");
+/** `work`, or TIMED_OUT once `ms` pass (the work carries on in the background). */
+async function withinBudget<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const expired = new Promise<typeof TIMED_OUT>(resolve => {
+		timer = setTimeout(() => resolve(TIMED_OUT), ms);
+	});
+	work.catch(() => {});
+	return Promise.race([work, expired]).finally(() => clearTimeout(timer));
+}
 
 export default function p4Extension(pi: ExtensionAPI) {
 	const type = pi.arktype;
@@ -146,11 +165,14 @@ export default function p4Extension(pi: ExtensionAPI) {
 	const editNotes = new Map<string, string[]>();
 	/** Which changelist work goes into (see src/changes.ts). */
 	const router = new ChangeRouter(path.join(pi.pi.getAgentDir(), "omp-p4.json"));
-	/**
-	 * Paths edit/write created, deleted or changed without p4 since the last reconcile,
-	 * keyed by client, then by the changelist they go to (decided when the file was written).
-	 */
-	const pendingReconcile = new Map<string, { ws: Workspace; byChange: Map<string, Set<string>> }>();
+	/** Per client: p4 files edited most recently (newest last); new files follow them. */
+	const recentEdits = new Map<string, string[]>();
+	/** Background lookups of which changelist edited files are in (see trackEdits). */
+	let tracking: Promise<unknown> = Promise.resolve();
+	/** Per edit/write call: which of the paths it names existed before it ran. */
+	const existedBefore = new Map<string, Set<string>>();
+	/** New or deleted files already pointed out to the agent. */
+	const mentioned = new Set<string>();
 	/** Code state before each prompt's first change, keyed by that prompt's user message entry, then by client. */
 	const snapshots = new Map<string, Map<string, Snapshot>>();
 	/** The current prompt's snapshots (taken lazily, on the first mutating tool call). */
@@ -172,52 +194,50 @@ export default function p4Extension(pi: ExtensionAPI) {
 	}
 	const isDepotPath = (p: string) => p.startsWith("//");
 
-	/** Open adds/deletes/moves queued by edit/write: one `p4 reconcile` per client and changelist. */
-	async function flushReconcile(): Promise<string[]> {
-		const problems: string[] = [];
-		for (const [client, { ws, byChange }] of pendingReconcile) {
-			pendingReconcile.delete(client);
-			statusDirty = true;
-			for (const [queued, paths] of byChange) {
-				try {
-					const open = (change: string) => reconcile(ws, [...paths], { change });
-					let change = queued;
-					let result;
-					try {
-						result = await open(queued);
-					} catch (err) {
-						// The changelist was submitted or deleted meanwhile: start a fresh one.
-						if (!isStaleChangeError(err)) throw err;
-						router.forget(ws, queued);
-						change = await router.createFor(ws);
-						result = await open(change);
-					}
-					for (const e of result.entries) router.noteLanding(ws, change, e.localPath, e.action);
-				} catch (err) {
-					problems.push(`p4 reconcile failed for ${[...paths].join(", ")}: ${errorText(err)}`);
-				}
+	/**
+	 * Note, in the background, which changelist edited files are open in, so new files
+	 * follow the latest one. Edits themselves never wait on p4.
+	 */
+	function trackEdits(ws: Workspace, files: string[]): void {
+		if (files.length === 0) return;
+		const list = (recentEdits.get(ws.client) ?? []).filter(f => !files.includes(f));
+		recentEdits.set(ws.client, [...list, ...files].slice(-10));
+		tracking = tracking.then(async () => {
+			const state = await openedState(ws, files).catch(() => new Map<string, never>());
+			for (const file of files) {
+				const open = state.get(file);
+				if (!open || open.change === "default") continue;
+				router.follow(ws, open.change);
+				router.noteLanding(ws, open.change, file, open.action);
+				statusDirty = true;
 			}
-		}
-		return problems;
+		});
 	}
 
-	/** Queue `file` for the changelist new files follow right now (creating one for the task if needed). */
-	async function queueReconcile(ws: Workspace, file: string): Promise<void> {
-		const change = await router.target(ws);
-		const queue = pendingReconcile.get(ws.client) ?? { ws, byChange: new Map<string, Set<string>>() };
-		const set = queue.byChange.get(change) ?? new Set<string>();
-		set.add(file);
-		queue.byChange.set(change, set);
-		pendingReconcile.set(ws.client, queue);
+	/** Before opening files: let pending edit lookups finish (briefly), so routing is current. */
+	async function settleTracking(): Promise<void> {
+		await withinBudget(tracking, 5_000);
+	}
+
+	/** Tell the user once per session that Perforce was too slow for something, and how to see why. */
+	let slowNoticeShown = false;
+	function slowNotice(ctx: ExtensionContext, what: string): void {
+		if (slowNoticeShown) return;
+		slowNoticeShown = true;
+		notify(
+			ctx,
+			`Perforce is slow to answer here: ${what} took over ${HOOK_BUDGET_MS / 1000} s, so it carries on in the background. Start omp with OMP_P4_TRACE=<file> to see which p4 calls are slow.`,
+			"warning",
+		);
 	}
 
 	/**
-	 * The workspace a tool call is about, with queued reconciles applied: the one
+	 * The workspace a tool call is about, with edit lookups settled: the one
 	 * owning `root` or the first local path, the client owning `change`, else the
 	 * cwd's (or the first Perforce root's).
 	 */
 	async function ready(ctx: ExtensionContext, hint: { root?: string; paths?: string[]; change?: string } = {}): Promise<Workspace> {
-		await flushReconcile();
+		await settleTracking();
 		const local = hint.paths?.find(p => !isDepotPath(p));
 		let ws: Workspace | null = null;
 		if (hint.root) ws = await workspaceForPath(ctx, hint.root);
@@ -288,6 +308,7 @@ export default function p4Extension(pi: ExtensionAPI) {
 		const ws = await findWorkspace(path.dirname(req.dst));
 		if (!ws || !p4OwnsPath(ws, req.dst)) return false; // not depot content, or inside a nested git repo
 		try {
+			await settleTracking();
 			const { change, result: warnings } = await router.withTarget(ws, c => openForEdit(ws, req.dst, c));
 			router.noteLanding(ws, change, canonical(req.dst), "edit");
 			statusDirty = true;
@@ -317,11 +338,13 @@ export default function p4Extension(pi: ExtensionAPI) {
 		}
 	});
 
-	// ── Queue what edit/write did, explain check-out results ────────────────
+	// ── After edit/write: check-out results, and new or deleted files ───────
 
 	pi.on("tool_result", async (event, ctx) => {
 		if (event.toolName !== "edit" && event.toolName !== "write") return;
 		const touched = touchedPaths(event, ctx.cwd);
+		const before = existedBefore.get(event.toolCallId);
+		existedBefore.delete(event.toolCallId);
 		if (touched.length === 0) return;
 
 		if (event.isError) {
@@ -332,29 +355,29 @@ export default function p4Extension(pi: ExtensionAPI) {
 				additionalContext: `Perforce could not open the file for edit:\n${reasons.join("\n")}\nTell the user; do not chmod the file.`,
 			};
 		}
-		// Paths in git roots (or nested git repos) are dropped here and left to git.
 		const context: string[] = [];
-		for (const { ws, files } of (await groupByWorkspace(ctx, touched)).values()) {
-			const before = router.current(ws);
-			// Files already open stay where they are, and new files follow them there.
-			const state = await openedState(ws, files).catch(() => new Map());
+		// Paths in git roots (or nested git repos) are dropped here and left to git.
+		const groups = await withinBudget(groupByWorkspace(ctx, touched), HOOK_BUDGET_MS);
+		if (groups === TIMED_OUT) slowNotice(ctx, "finding which Perforce client a file belongs to");
+		const unopened: string[] = [];
+		for (const { ws, files } of groups === TIMED_OUT ? [] : groups.values()) {
+			const present = files.filter(f => fsSync.existsSync(f));
+			trackEdits(ws, present);
 			for (const file of files) {
-				const open = state.get(file);
-				if (open && open.change !== "default") {
-					router.follow(ws, open.change);
-					router.noteLanding(ws, open.change, file, open.action);
-				} else if (!open) {
-					await queueReconcile(ws, file);
-				}
+				if (mentioned.has(file)) continue;
+				const exists = present.includes(file);
+				const existed = before?.has(file);
+				const rel = path.relative(ctx.cwd, file) || file;
+				if (exists && existed === false) unopened.push(`  new      ${rel}`);
+				else if (!exists && existed !== false) unopened.push(`  deleted  ${rel}`);
+				else continue;
+				mentioned.add(file);
 			}
-			const now = router.current(ws);
-			if (now && now !== before && !router.isCreated(ws, now)) {
-				if (router.description(now) === undefined) await router.loadDescriptions(ws).catch(() => {});
-				const desc = router.description(now);
-				context.push(
-					`${files.length === 1 ? path.basename(files[0]) : "These files are"} open in the user's changelist ${now}${desc ? ` ("${firstLine(desc, 60)}")` : ""}; the edit stays there, and new files will follow into ${now}. If this work does not belong there, use p4_change.`,
-				);
-			}
+		}
+		if (unopened.length > 0) {
+			context.push(
+				`Not in Perforce yet (edit and write only check out existing files):\n${unopened.join("\n")}\nIf they belong in the change, open them with p4_reconcile; leave out scratch files, notes and generated output.`,
+			);
 		}
 
 		const notes = touched.flatMap(p => editNotes.get(p) ?? []);
@@ -372,7 +395,9 @@ export default function p4Extension(pi: ExtensionAPI) {
 	// ── Session wiring ──────────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
-		const all = await p4Workspaces(ctx);
+		const found = await withinBudget(p4Workspaces(ctx), HOOK_BUDGET_MS);
+		if (found === TIMED_OUT) return slowNotice(ctx, "p4 info at startup");
+		const all = found;
 		await syncToolVisibility(all.length > 0);
 		if (all.length === 0) {
 			const result = await p4(["info"], { cwd: ctx.cwd, timeoutMs: 10_000 }).catch(() => undefined);
@@ -429,26 +454,28 @@ export default function p4Extension(pi: ExtensionAPI) {
 	}
 
 	pi.on("turn_end", async (_event, ctx) => {
-		const problems = await flushReconcile();
-		for (const problem of problems) notify(ctx, problem, "warning");
-		// Changelists the agent created and then emptied (moves, splits) go away; the one new
-		// files follow stays until the prompt ends, since "new CL for this" starts out empty.
-		for (const ws of await p4Workspaces(ctx).catch(() => [])) await router.dropEmpty(ws, { keepCurrent: true }).catch(() => []);
-		if (statusDirty) void refreshStatus(ctx).catch(() => {});
-		maybeRefreshCompletions(await p4Workspaces(ctx).catch(() => []));
+		// Nothing here needs to hold up the next turn.
+		void (async () => {
+			await tracking;
+			// Changelists the agent created and then emptied (moves, splits) go away; the one new
+			// files follow stays until the prompt ends, since "new CL for this" starts out empty.
+			for (const ws of await p4Workspaces(ctx).catch(() => [])) await router.dropEmpty(ws, { keepCurrent: true }).catch(() => []);
+			if (statusDirty) await refreshStatus(ctx).catch(() => {});
+			maybeRefreshCompletions(await p4Workspaces(ctx).catch(() => []));
+		})();
 	});
 
-	// End of a prompt: say where the work went when it went somewhere new. Turns already
-	// flushed and tidied (turn_end); say it first, since a print-mode run exits right after.
+	// End of a prompt: say where the work went when it went somewhere new. Say it first,
+	// since a print-mode run exits right after; tidying happens in the background.
 	pi.on("agent_end", async (_event, ctx) => {
 		if (ctx.agent?.kind === "sub") return;
-		if (pendingReconcile.size > 0) {
-			for (const problem of await flushReconcile()) notify(ctx, problem, "warning");
-		}
+		await withinBudget(tracking, 3_000);
 		const summary = router.promptSummary();
 		if (summary) notify(ctx, summary, "info");
-		for (const ws of await p4Workspaces(ctx).catch(() => [])) await router.dropEmpty(ws).catch(() => []);
-		void refreshStatus(ctx).catch(() => {});
+		void (async () => {
+			for (const ws of await p4Workspaces(ctx).catch(() => [])) await router.dropEmpty(ws).catch(() => []);
+			await refreshStatus(ctx).catch(() => {});
+		})();
 	});
 
 	/** Tell the agent once about a changelist created for its work, so it describes it properly later. */
@@ -464,26 +491,6 @@ export default function p4Extension(pi: ExtensionAPI) {
 		return `New files went into a pending changelist created for this task: ${fresh.join(", ")}. The description is provisional; when the work in it is done, give it a real one with p4_change action "describe" (match the style shown by p4_changes).`;
 	}
 
-	// Bash: tell the agent about files a command changed without p4 knowing.
-	pi.on("tool_result", async (event, ctx) => {
-		if (event.toolName !== "bash") return;
-		const input = event.input as { command?: unknown; cwd?: unknown };
-		if (typeof input.command !== "string" || !mayWriteFiles(input.command)) return;
-		const cwd = path.resolve(ctx.cwd, typeof input.cwd === "string" ? input.cwd : ".");
-		const ws = await workspaceForPath(ctx, cwd).catch(() => null);
-		if (!ws) return; // git root, untracked folder, or no Perforce here
-		const queued = new Set([...(pendingReconcile.get(ws.client)?.byChange.values() ?? [])].flatMap(set => [...set]));
-		const changes = (await unopenedChanges(ws, scanTargets(ws, input.command, cwd))).filter(c => !queued.has(c.localPath));
-		if (changes.length === 0) return;
-		const shown = changes.slice(0, 15).map(c => `  ${c.action.padEnd(7)} ${c.depotFile}`);
-		if (changes.length > 15) shown.push(`  … and ${changes.length - 15} more`);
-		return {
-			additionalContext:
-				`That command changed files Perforce does not know about yet:\n${shown.join("\n")}\n` +
-				`If they belong in this work, open them with p4_reconcile (they go to ${router.current(ws) ? `changelist ${router.current(ws)}` : "a changelist created for this task"}). If they are build or tool outputs, leave them (they belong in P4IGNORE) and mention it to the user.`,
-		};
-	});
-
 	// p4 tools (shelve, resolve, unshelve, …) change what the footer shows.
 	pi.on("tool_result", async event => {
 		if (event.toolName.startsWith("p4_")) statusDirty = true;
@@ -496,45 +503,59 @@ export default function p4Extension(pi: ExtensionAPI) {
 	 * change nothing cost no p4 calls.
 	 */
 	pi.on("tool_call", async (event, ctx) => {
-		if (ctx.agent?.kind === "sub") return;
 		if (event.toolName !== "edit" && event.toolName !== "write" && event.toolName !== "bash") return;
-		if (!promptSnapshots) {
-			promptSnapshots = new Map();
-			const all = await p4Workspaces(ctx).catch(() => []);
-			const branch = ctx.sessionManager.getBranch();
-			const prompt = [...branch].reverse().find(e => {
-				const entry = e as { type: string; message?: { role?: string } };
-				return entry.type === "message" && entry.message?.role === "user";
-			}) as { id: string } | undefined;
-			if (all.length > 0 && prompt) {
-				await flushReconcile();
-				for (const ws of all) {
-					const snapshot = await takeSnapshot(ws).catch(() => undefined);
-					if (snapshot) promptSnapshots.set(ws.client, snapshot);
-				}
-				snapshots.set(prompt.id, promptSnapshots);
-			}
-		}
-		if (promptSnapshots.size === 0) return;
-		if (event.toolName === "bash") {
-			for (const snapshot of promptSnapshots.values()) await captureOpened(snapshot);
-			return;
-		}
 		const input = event.input as { path?: unknown; edits?: { to?: unknown }[] };
-		const named = [input.path, ...(Array.isArray(input.edits) ? input.edits.map(e => e?.to) : [])]
-			.filter((p): p is string => typeof p === "string" && p.length > 0 && !/^[a-z][a-z0-9+.-]*:\/\//i.test(p))
-			.map(p => canonical(path.resolve(ctx.cwd, p)));
-		for (const { ws, files } of (await groupByWorkspace(ctx, named).catch(() => new Map())).values()) {
-			const snapshot = promptSnapshots.get(ws.client);
-			if (snapshot) await captureFiles(snapshot, files);
-		}
+		const named =
+			event.toolName === "bash"
+				? []
+				: [input.path, ...(Array.isArray(input.edits) ? input.edits.map(e => e?.to) : [])]
+						.filter((p): p is string => typeof p === "string" && p.length > 0 && !/^[a-z][a-z0-9+.-]*:\/\//i.test(p))
+						.map(p => canonical(path.resolve(ctx.cwd, p)));
+		// So the result can tell a new file from an edited one (no p4 involved).
+		if (named.length > 0) existedBefore.set(event.toolCallId, new Set(named.filter(p => fsSync.existsSync(p))));
+		if (ctx.agent?.kind === "sub") return;
+
+		const snapshot = async () => {
+			if (!promptSnapshots) {
+				promptSnapshots = new Map();
+				const all = await p4Workspaces(ctx).catch(() => []);
+				const branch = ctx.sessionManager.getBranch();
+				const prompt = [...branch].reverse().find(e => {
+					const entry = e as { type: string; message?: { role?: string } };
+					return entry.type === "message" && entry.message?.role === "user";
+				}) as { id: string } | undefined;
+				if (all.length > 0 && prompt) {
+					const taken = promptSnapshots;
+					for (const ws of all) {
+						const snap = await takeSnapshot(ws).catch(() => undefined);
+						if (snap) taken.set(ws.client, snap);
+					}
+					snapshots.set(prompt.id, taken);
+				}
+			}
+			// Contents must be copied before the tool runs, so copying stops at the deadline.
+			const deadline = Date.now() + SNAPSHOT_COPY_MS;
+			if (event.toolName === "bash") {
+				// Bash may change any open file; copy the ones in this session's changelists.
+				for (const ws of await p4Workspaces(ctx).catch(() => [])) {
+					const snap = promptSnapshots.get(ws.client);
+					if (snap) await captureOpened(snap, new Set(router.touched(ws)), deadline);
+				}
+				return;
+			}
+			for (const { ws, files } of (await groupByWorkspace(ctx, named).catch(() => new Map())).values()) {
+				const snap = promptSnapshots.get(ws.client);
+				if (snap) await captureFiles(snap, files, deadline);
+			}
+		};
+		if ((await withinBudget(snapshot(), HOOK_BUDGET_MS)) === TIMED_OUT) slowNotice(ctx, "recording the rewind snapshot");
 	});
 
 	pi.on("session_before_branch", async (event, ctx) => {
 		if (event.reason !== "branch" || !ctx.hasUI) return;
 		const byClient = snapshots.get(event.entryId);
 		if (!byClient) return;
-		await flushReconcile();
+		await settleTracking();
 		const plans = [];
 		for (const ws of await p4Workspaces(ctx)) {
 			const snapshot = byClient.get(ws.client);
@@ -573,7 +594,12 @@ export default function p4Extension(pi: ExtensionAPI) {
 			promptSnapshots = undefined;
 			router.startPrompt(event.prompt);
 		}
-		const roots = await sessionRoots(ctx);
+		const found = await withinBudget(sessionRoots(ctx), HOOK_BUDGET_MS);
+		if (found === TIMED_OUT) {
+			slowNotice(ctx, "p4 info before the prompt");
+			return undefined;
+		}
+		const roots = found;
 		const hasP4 = roots.some(r => r.kind === "p4");
 		await syncToolVisibility(hasP4);
 		// Roots can change between prompts (/add-dir), so replace any earlier note.
@@ -1065,7 +1091,7 @@ export default function p4Extension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const ws = await chooseWorkspace(ctx, "should /p4-change work on");
 			if (!ws) return notify(ctx, "No Perforce client among this session's roots.", "error");
-			await flushReconcile();
+			await settleTracking();
 			try {
 				await runChangeCommand(ws, args, ctx, router);
 			} catch (err) {
@@ -1084,7 +1110,7 @@ export default function p4Extension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const sub = args.trim();
 			if (sub === "ignore" || sub === "ignore off") return ignoreCommand(ctx, sub === "ignore off");
-			await flushReconcile();
+			await settleTracking();
 			const lines: string[] = [];
 			for (const root of await sessionRoots(ctx)) {
 				if (root.kind !== "p4" || !root.ws) {
@@ -1121,7 +1147,7 @@ export default function p4Extension(pi: ExtensionAPI) {
 			const change = args.split(/\s+/).find(t => /^\d+$/.test(t));
 			const ws = change ? await workspaceForChange(ctx, change) : await chooseWorkspace(ctx, "should /p4-review look at");
 			if (!ws) return notify(ctx, "No Perforce client among this session's roots.", "error");
-			await flushReconcile();
+			await settleTracking();
 			try {
 				await runReviewCommand(ws, args, ctx, router.touched(ws));
 			} catch (err) {
@@ -1215,10 +1241,9 @@ function systemNote(roots: RootInfo[], inPlay: string[]): string {
 	return [
 		`# Perforce workspace ${NOTE_TAG}`,
 		...where,
-		"Depot files are read-only until opened. The edit and write tools open them for you (p4 edit/add/delete); never chmod files to make them writable.",
+		"Depot files are read-only until opened. The edit and write tools check out existing depot files for you (p4 edit); never chmod files to make them writable. New and deleted files are not opened automatically: you decide. Open the ones that belong in the change with p4_reconcile (for bash-made changes too: pass the files or folders you touched), and leave out scratch files, notes and generated output.",
 		"Changelists: a file that is already open stays in its changelist. Files you open or create follow the file you last edited into its changelist; with nothing to follow, they go to a changelist created for the task, whose provisional description you replace with a real one (p4_change describe) once that work is done. When the user says where work belongs (\"new CL for this\", \"put it in my fifo CL\", \"move X to 4720\"), use p4_change. One file can only be in one changelist: if a file needs changes for two separate pieces of work, say so instead of mixing them.",
 		...inPlay,
-		"Files created or deleted by edit/write are opened in Perforce at the end of the turn. After bash commands that change files, you will be told what Perforce does not know about yet; open what belongs in the work with p4_reconcile.",
 		"Review your changes with p4_opened and p4_diff. Use p4_changes and p4_describe for history. Read other branches, streams or old revisions with read p4://<depot path>#rev instead of syncing.",
 		"Shelve for review with p4_shelve and bring shelves (including colleagues' reviews) into your work with p4_unshelve. When submitting from bash, always name the changelist (p4 submit -c <n>) and never submit the default changelist by accident.",
 		"P4 Code Review (Swarm): reviews are started by shelving a change whose description has #review (p4_shelve with review=true), and a change joins an existing review with #review-<id> (review=<id>); re-shelving updates the review. Each changelist is its own review. Do this only when the user asks for a review. Read reviews with p4_review_comments; reply or mark tasks addressed only when the user asked, since posts appear under the user's name.",
